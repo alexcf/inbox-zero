@@ -15,6 +15,7 @@ export const ErrorType = {
   INSUFFICIENT_CREDITS: "Insufficient AI credits",
   TRIAL_AI_LIMIT_REACHED: "Trial AI limit reached",
   ACCOUNT_DISCONNECTED: "Account disconnected",
+  EMAIL_WATCH_LAPSED: "Email automation stopped",
   // Legacy keys kept for clearing old stored errors
   INCORRECT_OPENAI_API_KEY: "Incorrect OpenAI API key",
   OPENAI_API_KEY_DEACTIVATED: "OpenAI API key deactivated",
@@ -33,6 +34,12 @@ export type PersistedErrorType = Exclude<
   ErrorTypeValue,
   typeof ErrorType.TRIAL_AI_LIMIT_REACHED
 >;
+
+// A user can have several accounts, so EMAIL_WATCH_LAPSED is keyed per account
+// rather than per errorType.
+export function watchLapsedErrorKey(emailAccountId: string): string {
+  return `${ErrorType.EMAIL_WATCH_LAPSED}:${emailAccountId}`;
+}
 
 export async function getUserErrorMessages(
   userId: string,
@@ -112,7 +119,7 @@ export async function clearSpecificErrorMessages({
   logger,
 }: {
   userId: string;
-  errorTypes: ErrorTypeValue[];
+  errorTypes: string[];
   logger: Logger;
 }): Promise<void> {
   try {
@@ -142,6 +149,56 @@ export async function clearSpecificErrorMessages({
     });
     captureException(error, { extra: { userId, errorTypes } });
   }
+}
+
+export async function clearAccountDisconnectedErrorIfResolved({
+  userId,
+  logger,
+}: {
+  userId: string;
+  logger: Logger;
+}): Promise<void> {
+  let disconnectedAccounts: number;
+  try {
+    disconnectedAccounts = await prisma.emailAccount.count({
+      where: {
+        userId,
+        account: { disconnectedAt: { not: null } },
+      },
+    });
+  } catch (error) {
+    logger.error("Error checking account disconnected errors:", {
+      userId,
+      error,
+    });
+    captureException(error, { extra: { userId } });
+    return;
+  }
+
+  if (disconnectedAccounts > 0) return;
+
+  await clearSpecificErrorMessages({
+    userId,
+    errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
+    logger,
+  });
+}
+
+// Callers must confirm the account's watch is healthy before calling this.
+export async function clearWatchLapsedErrorIfResolved({
+  userId,
+  emailAccountId,
+  logger,
+}: {
+  userId: string;
+  emailAccountId: string;
+  logger: Logger;
+}): Promise<void> {
+  await clearSpecificErrorMessages({
+    userId,
+    errorTypes: [watchLapsedErrorKey(emailAccountId)],
+    logger,
+  });
 }
 
 const errorTypeConfig: Record<
@@ -178,6 +235,11 @@ const errorTypeConfig: Record<
     actionUrl: "/accounts",
     actionLabel: "Reconnect Account",
   },
+  [ErrorType.EMAIL_WATCH_LAPSED]: {
+    label: "Email Automation Stopped",
+    actionUrl: "/accounts",
+    actionLabel: "Reconnect Account",
+  },
   // Legacy keys — only needed so old stored errors can still render
   [ErrorType.INCORRECT_OPENAI_API_KEY]: {
     label: "API Key Issue",
@@ -202,6 +264,7 @@ export async function addUserErrorMessageWithNotification({
   emailAccountId,
   errorType,
   errorMessage,
+  storageKey = errorType,
   logger,
 }: {
   userId: string;
@@ -209,6 +272,7 @@ export async function addUserErrorMessageWithNotification({
   emailAccountId: string;
   errorType: PersistedErrorType;
   errorMessage: string;
+  storageKey?: string;
   logger: Logger;
 }): Promise<void> {
   try {
@@ -223,8 +287,11 @@ export async function addUserErrorMessageWithNotification({
     }
 
     const currentErrorMessages = (user.errorMessages as ErrorMessages) || {};
-    const existingEntry = currentErrorMessages[errorType];
+    const existingEntry = currentErrorMessages[storageKey];
     const shouldSendEmail = !existingEntry?.emailSentAt;
+
+    // Nothing changed since the last write - skip it.
+    if (!shouldSendEmail && existingEntry?.message === errorMessage) return;
 
     const newEntry: ErrorMessageEntry = {
       message: errorMessage,
@@ -265,7 +332,7 @@ export async function addUserErrorMessageWithNotification({
 
     const newErrorMessages = {
       ...currentErrorMessages,
-      [errorType]: newEntry,
+      [storageKey]: newEntry,
     };
 
     await prisma.user.update({

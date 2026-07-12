@@ -1,7 +1,7 @@
 import { withSentryConfig } from "@sentry/nextjs";
 import { withAxiom } from "next-axiom";
 import nextMdx from "@next/mdx";
-import withSerwistInit from "@serwist/next";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { env } from "./env";
 import type { NextConfig } from "next";
@@ -15,6 +15,10 @@ const withMDX = nextMdx({
 const isDevelopment = process.env.NODE_ENV === "development";
 const isProductionBuild = process.env.NODE_ENV === "production";
 const repoRoot = path.resolve(import.meta.dirname, "../..");
+const nextPackageRoot = path.dirname(
+  realpathSync(require.resolve("next/package.json")),
+);
+const turbopackRoot = commonAncestorPath(repoRoot, nextPackageRoot);
 const zodV4CorePath = path.join(
   path.dirname(require.resolve("zod/package.json")),
   "v4/core/index.js",
@@ -59,13 +63,16 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: process.env.SKIP_TYPE_CHECK === "true",
   },
   serverExternalPackages: [
+    "@chat-adapter/teams",
     "@sentry/nextjs",
     "@sentry/node",
+    "@vercel/queue",
+    "bullmq",
     "mammoth",
     "unpdf",
   ],
   turbopack: {
-    root: repoRoot,
+    root: turbopackRoot,
     rules: {
       "*.svg": {
         loaders: ["@svgr/webpack"],
@@ -391,12 +398,6 @@ const sentryConfig = {
   // For all available options, see:
   // https://docs.sentry.io/platforms/javascript/guides/nextjs/manual-setup/
 
-  // Upload a larger set of source maps for prettier stack traces (increases build time)
-  widenClientFileUpload: true,
-
-  // Transpiles SDK to be compatible with IE11 (increases bundle size)
-  transpileClientSDK: true,
-
   // Routes browser requests to Sentry through a Next.js rewrite to circumvent ad-blockers (increases server load)
   tunnelRoute: "/monitoring",
 
@@ -437,11 +438,23 @@ if (env.MICROSOFT_CLIENT_ID && !env.MICROSOFT_WEBHOOK_CLIENT_STATE) {
   );
 }
 
-const withSerwist = withSerwistInit({
-  swSrc: "app/sw.ts",
-  swDest: "public/sw.js",
-  disable: process.env.NODE_ENV !== "production",
-  maximumFileSizeToCacheInBytes: 3 * 1024 * 1024, // 3MB
-});
+// The service worker is built separately by `serwist build` (serwist.config.mjs)
+// because the @serwist/next webpack plugin doesn't support Turbopack.
 
-export default withAxiom(withSerwist(exportConfig));
+export default withAxiom(exportConfig);
+
+function commonAncestorPath(firstPath: string, secondPath: string) {
+  const [firstParts, secondParts] = [firstPath, secondPath].map((value) =>
+    path.resolve(value).split(path.sep),
+  );
+  const commonParts: string[] = [];
+
+  for (let index = 0; index < firstParts.length; index += 1) {
+    if (firstParts[index] !== secondParts[index]) break;
+    commonParts.push(firstParts[index]);
+  }
+
+  return commonParts.length === 1 && commonParts[0] === ""
+    ? path.sep
+    : commonParts.join(path.sep);
+}

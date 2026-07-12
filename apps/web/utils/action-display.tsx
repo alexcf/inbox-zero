@@ -15,6 +15,7 @@ import {
   MailIcon,
   NewspaperIcon,
   StarIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { truncate } from "@/utils/string";
 
@@ -79,6 +80,8 @@ export function getActionDisplay(
     }
     case ActionType.ARCHIVE:
       return "Archive";
+    case ActionType.DELETE:
+      return "Delete";
     case ActionType.MARK_READ:
       return "Mark Read";
     case ActionType.STAR:
@@ -114,12 +117,33 @@ export function getActionDisplay(
   }
 }
 
+export const ACTION_TYPE_LABELS = {
+  [ActionType.LABEL]: "Label",
+  [ActionType.ARCHIVE]: "Archive",
+  [ActionType.DELETE]: "Delete",
+  [ActionType.MARK_READ]: "Mark read",
+  [ActionType.MARK_SPAM]: "Mark spam",
+  [ActionType.STAR]: "Star",
+  [ActionType.MOVE_FOLDER]: "Move to folder",
+  [ActionType.FORWARD]: "Forward",
+  [ActionType.REPLY]: "Reply",
+  [ActionType.SEND_EMAIL]: "Send email",
+  [ActionType.DRAFT_EMAIL]: "Draft reply",
+  [ActionType.DRAFT_MESSAGING_CHANNEL]: "Draft to chat channel",
+  [ActionType.NOTIFY_MESSAGING_CHANNEL]: "Notify chat channel",
+  [ActionType.CALL_WEBHOOK]: "Call webhook",
+  [ActionType.DIGEST]: "Add to digest",
+  [ActionType.NOTIFY_SENDER]: "Notify sender",
+} satisfies Record<ActionType, string>;
+
 export function getActionIcon(actionType: ActionType) {
   switch (actionType) {
     case ActionType.LABEL:
       return TagIcon;
     case ActionType.ARCHIVE:
       return ArchiveIcon;
+    case ActionType.DELETE:
+      return Trash2Icon;
     case ActionType.MOVE_FOLDER:
       return FolderInputIcon;
     case ActionType.DRAFT_EMAIL:

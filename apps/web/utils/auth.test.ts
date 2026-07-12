@@ -3,26 +3,43 @@ import { cookies } from "next/headers";
 import { createReferral } from "@/utils/referral/referral-code";
 import { captureException } from "@/utils/error";
 import { saveTokens } from "@/utils/auth/save-tokens";
+import { createOutlookClient } from "@/utils/outlook/client";
 import {
   betterAuthConfig,
   handleLinkAccount,
   handleReferralOnSignUp,
 } from "@/utils/auth";
 import prisma from "@/utils/__mocks__/prisma";
-import { clearSpecificErrorMessages } from "@/utils/error-messages";
+import { clearAccountDisconnectedErrorIfResolved } from "@/utils/error-messages";
 
-vi.mock("better-auth", () => ({
-  betterAuth: vi.fn((options: unknown) => ({
-    api: {
-      getSession: vi.fn(),
-    },
-    options,
-  })),
-}));
+vi.mock("better-auth", () => {
+  class APIError extends Error {
+    body?: { code?: string; message?: string };
+
+    constructor(_status: string, body?: { code?: string; message?: string }) {
+      super(body?.message);
+      this.body = body;
+    }
+
+    static from(status: string, body?: { code?: string; message?: string }) {
+      return new APIError(status, body);
+    }
+  }
+
+  return {
+    APIError,
+    betterAuth: vi.fn((options: unknown) => ({
+      api: {
+        getSession: vi.fn(),
+      },
+      options,
+    })),
+  };
+});
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/error-messages", () => ({
   addUserErrorMessage: vi.fn().mockResolvedValue(undefined),
-  clearSpecificErrorMessages: vi.fn().mockResolvedValue(undefined),
+  clearAccountDisconnectedErrorIfResolved: vi.fn().mockResolvedValue(undefined),
   ErrorType: {
     ACCOUNT_DISCONNECTED: "Account disconnected",
   },
@@ -34,6 +51,9 @@ vi.mock("@googleapis/gmail", () => ({
   auth: {
     OAuth2: vi.fn(),
   },
+}));
+vi.mock("@/utils/outlook/client", () => ({
+  createOutlookClient: vi.fn(),
 }));
 vi.mock("@/utils/encryption", () => ({
   encryptToken: vi.fn((t) => t),
@@ -164,10 +184,9 @@ describe("saveTokens", () => {
         }),
       }),
     );
-    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user_1",
-        errorTypes: ["Account disconnected"],
       }),
     );
   });
@@ -209,10 +228,9 @@ describe("saveTokens", () => {
       }),
     });
     expect(prisma.emailAccount.update).not.toHaveBeenCalled();
-    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user_1",
-        errorTypes: ["Account disconnected"],
       }),
     );
   });
@@ -236,7 +254,7 @@ describe("saveTokens", () => {
     });
 
     expect(result).toEqual({ status: "conflict" });
-    expect(clearSpecificErrorMessages).not.toHaveBeenCalled();
+    expect(clearAccountDisconnectedErrorIfResolved).not.toHaveBeenCalled();
   });
 
   it("clears disconnectedAt and error messages when saving tokens via providerAccountId", async () => {
@@ -266,10 +284,9 @@ describe("saveTokens", () => {
         }),
       }),
     );
-    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user_1",
-        errorTypes: ["Account disconnected"],
       }),
     );
   });
@@ -292,7 +309,7 @@ describe("handleLinkAccount", () => {
 
     expect(prisma.emailAccount.findUnique).not.toHaveBeenCalled();
     expect(prisma.emailAccount.upsert).not.toHaveBeenCalled();
-    expect(clearSpecificErrorMessages).not.toHaveBeenCalled();
+    expect(clearAccountDisconnectedErrorIfResolved).not.toHaveBeenCalled();
   });
 
   it("still requires an access token for mailbox providers", async () => {
@@ -306,5 +323,36 @@ describe("handleLinkAccount", () => {
     ).rejects.toThrow("Missing access token during account linking.");
 
     expect(prisma.emailAccount.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("raises a Better Auth error code when the mailbox belongs to another user", async () => {
+    vi.mocked(createOutlookClient).mockReturnValue({
+      getUserProfile: vi.fn().mockResolvedValue({
+        mail: "user@example.com",
+        displayName: "Test User",
+      }),
+      getUserPhoto: vi.fn().mockResolvedValue(null),
+    } as any);
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      id: "email_account_1",
+      userId: "existing_user",
+      accountId: "existing_account",
+      account: { provider: "microsoft" },
+    } as any);
+
+    await expect(
+      handleLinkAccount({
+        id: "account_1",
+        userId: "new_user",
+        providerId: "microsoft",
+        accessToken: "access_token",
+      } as any),
+    ).rejects.toMatchObject({
+      message: "email_already_linked",
+      body: {
+        code: "email_already_linked",
+        message: "email_already_linked",
+      },
+    });
   });
 });

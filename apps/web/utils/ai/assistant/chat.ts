@@ -18,7 +18,7 @@ import { getUserRulesAndSettingsTool } from "./tools/rules/get-user-rules-and-se
 import { updatePersonalInstructionsTool } from "./tools/rules/update-personal-instructions-tool";
 import { updateLearnedPatternsTool } from "./tools/rules/update-learned-patterns-tool";
 import { updateRuleTool } from "./tools/rules/update-rule-tool";
-import { updateRuleStateTool } from "./tools/rules/update-rule-state-tool";
+import { deleteRuleTool } from "./tools/rules/delete-rule-tool";
 import { getAssistantCapabilitiesTool } from "./tools/settings/get-assistant-capabilities-tool";
 import { updateAssistantSettingsTool } from "./tools/settings/update-assistant-settings-tool";
 import {
@@ -42,7 +42,6 @@ import type { SerializedMatchReason } from "@/utils/ai/choose-rule/types";
 import {
   buildFreshRuleContextMessage,
   buildRuleReadState,
-  loadCurrentRulesRevision,
   loadAssistantRuleSnapshot,
   type RuleReadState,
 } from "./chat-rule-state";
@@ -106,6 +105,7 @@ export async function aiProcessAssistantChat({
   const webhookActionsEnabled =
     env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED !== false;
   let ruleReadState: RuleReadState | null = null;
+  const pendingRuleDeletionNames = new Set<string>();
   const memoryConversationMessages = conversationMessagesForMemory ?? messages;
   const userTimezone = user.timezone || "UTC";
   const currentTimestamp = new Date().toISOString();
@@ -129,6 +129,11 @@ export async function aiProcessAssistantChat({
       ruleReadState = state;
     },
     getRuleReadState: () => ruleReadState,
+    markRuleDeletionPending: (ruleName: string) => {
+      pendingRuleDeletionNames.add(ruleName);
+    },
+    hasPendingRuleDeletion: (ruleName: string) =>
+      pendingRuleDeletionNames.has(ruleName),
     onRulesStateExposed,
   };
   const providerPolicy = getAssistantChatProvider(user.account.provider);
@@ -144,10 +149,12 @@ export async function aiProcessAssistantChat({
 
     if (freshRuleState) {
       ruleReadState = freshRuleState.ruleReadState;
-      onRulesStateExposed?.(freshRuleState.snapshot.rulesRevision);
-      freshRuleContextMessage = [
-        buildFreshRuleContextMessage(freshRuleState.snapshot),
-      ];
+      if (freshRuleState.hasNewRuleState) {
+        onRulesStateExposed?.(freshRuleState.snapshot.rulesRevision);
+        freshRuleContextMessage = [
+          buildFreshRuleContextMessage(freshRuleState.snapshot),
+        ];
+      }
     }
   } catch (error) {
     logger.warn("Failed to load fresh rule state for chat", { error });
@@ -171,15 +178,10 @@ export async function aiProcessAssistantChat({
 
   const isFirstMessage = messages.filter((m) => m.role === "user").length <= 1;
 
-  const inboxContextMessage =
-    inboxStats && isFirstMessage
-      ? [
-          {
-            role: "user" as const,
-            content: `[Automated inbox snapshot — not a message from the user] Current inbox: ${inboxStats.total} emails total, ${inboxStats.unread} unread.`,
-          },
-        ]
-      : [];
+  const snapshotMessage = isFirstMessage
+    ? buildInboxSnapshotMessage(inboxStats)
+    : null;
+  const inboxContextMessage = snapshotMessage ? [snapshotMessage] : [];
 
   const hiddenContextMessage =
     context && context.type === "fix-rule"
@@ -253,7 +255,7 @@ export async function aiProcessAssistantChat({
     getLearnedPatterns: getLearnedPatternsTool(toolOptions),
     createRule: createRuleTool(toolOptions),
     updateRule: updateRuleTool(toolOptions),
-    updateRuleState: updateRuleStateTool(toolOptions),
+    deleteRule: deleteRuleTool(toolOptions),
     updateLearnedPatterns: updateLearnedPatternsTool(toolOptions),
     updatePersonalInstructions: updatePersonalInstructionsTool(toolOptions),
 
@@ -311,7 +313,15 @@ export async function aiProcessAssistantChat({
       });
       await onStepFinish?.(step);
     },
-    onModelResolved,
+    onModelResolved: (resolvedModel) => {
+      logger.info("Assistant chat model resolved", {
+        chatId,
+        emailAccountId,
+        provider: resolvedModel.provider,
+        modelName: resolvedModel.modelName,
+      });
+      onModelResolved?.(resolvedModel);
+    },
     maxSteps: ASSISTANT_CHAT_MAX_STEPS,
     tools: allTools,
   });
@@ -319,7 +329,7 @@ export async function aiProcessAssistantChat({
   return result;
 }
 
-async function loadFreshRuleContext({
+export async function loadFreshRuleContext({
   emailAccountId,
   chatLastSeenRulesRevision,
   chatHasHistory,
@@ -332,19 +342,15 @@ async function loadFreshRuleContext({
 
   const knownRulesRevision = chatLastSeenRulesRevision ?? -1;
 
-  const currentRulesRevision = await loadCurrentRulesRevision({
-    emailAccountId,
-  });
-
-  if (currentRulesRevision <= knownRulesRevision) return null;
-
   const snapshot = await loadAssistantRuleSnapshot({ emailAccountId });
 
-  if (snapshot.rulesRevision <= knownRulesRevision) return null;
-
+  // Rule-write tools reject writes without a recent read. The chat already saw
+  // this exact revision, so hydrate the read state even when nothing changed;
+  // only inject the fresh-context message when the revision advanced.
   return {
     snapshot,
     ruleReadState: buildRuleReadState(snapshot),
+    hasNewRuleState: snapshot.rulesRevision > knownRulesRevision,
   };
 }
 
@@ -629,6 +635,20 @@ function getEmailCapabilitiesPolicy({
   );
 }
 
+export function buildInboxSnapshotMessage(
+  inboxStats?: { total: number; unread: number } | null,
+): { role: "user"; content: string } | null {
+  if (!inboxStats) return null;
+
+  return {
+    role: "user",
+    content:
+      `[Automated inbox snapshot — not a message from the user] At conversation start: ${inboxStats.total} emails total, ${inboxStats.unread} unread. ` +
+      "This snapshot is a starting point only — counts may have changed since then as new mail arrives or actions are taken. " +
+      "Always call searchInbox to confirm the current state before answering questions about unread, new, or recent emails; do not rely on this number alone.",
+  };
+}
+
 export function buildResolvedSystemPrompt({
   emailSendToolsEnabled,
   draftReplyActionsEnabled,
@@ -718,7 +738,8 @@ export function buildResolvedSystemPrompt({
 - For low-priority repeated senders, you may suggest bulk archive by sender as an option, but default to archiving the specific threads shown.
 - For all-matching cleanup, paginate searchInbox until hasMore=false, collect matching threadIds across pages, then write in batches.
 - Do not turn one-time cleanup into a recurring rule unless the user asks for automation.
-- For ongoing sender-level batch cleanup, once the user confirms the category, continue subsequent batches without re-asking.`,
+- For ongoing sender-level batch cleanup, once the user confirms the category, continue subsequent batches without re-asking.
+- Never claim or report that the inbox is empty, fully caught up, or has no unread emails without first running searchInbox in this turn to confirm — the initial inbox snapshot and prior-turn results can be stale, and earlier search pages or filters may not cover the whole mailbox. Treat zero results from a single narrow query as inconclusive: broaden or re-run searchInbox before asserting absence. If the user signals doubt about a prior conclusion or asks you to re-check, re-run searchInbox with fresh (and broader, if the prior call was narrow) parameters and report the new results rather than rephrasing the prior conclusion.`,
     providerPolicy.ruleSuggestionPolicy,
     `Rules and automation:
 - For new rules, generate concise names. For edits or removals, fetch existing rules first and use exact names.

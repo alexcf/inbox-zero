@@ -6,7 +6,7 @@ import { oAuthProxy } from "better-auth/plugins";
 import { createContact as createLoopsContact } from "@inboxzero/loops";
 import { createContact as createResendContact } from "@inboxzero/resend";
 import type { Account, AuthContext } from "better-auth";
-import { betterAuth } from "better-auth";
+import { APIError, betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { nextCookies } from "better-auth/next-js";
 import { cookies, headers } from "next/headers";
@@ -42,13 +42,14 @@ import {
   updateAccountSeats,
 } from "@/utils/premium/seats";
 import { safeExpo } from "@/utils/mobile-auth/expo";
-import { clearSpecificErrorMessages, ErrorType } from "@/utils/error-messages";
+import { clearAccountDisconnectedErrorIfResolved } from "@/utils/error-messages";
 import { getEnabledLoginProviders } from "@/utils/oauth/login-providers";
 import { getAppleClientSecret } from "@/utils/auth/apple-client-secret";
 import { assertCanGenerateScimToken } from "@/utils/auth/scim";
 import prisma from "@/utils/prisma";
 
 const logger = createScopedLogger("auth");
+const EMAIL_ALREADY_LINKED_ERROR = "email_already_linked";
 const useGoogleOauthEmulator = isGoogleOauthEmulationEnabled();
 const useMicrosoftOauthEmulator = isMicrosoftEmulationEnabled();
 
@@ -611,7 +612,10 @@ export async function handleLinkAccount(account: Account) {
         existingUserId: existingEmailAccount.userId,
         newUserId: account.userId,
       });
-      throw new Error("email_already_linked");
+      throw APIError.from("BAD_REQUEST", {
+        message: EMAIL_ALREADY_LINKED_ERROR,
+        code: EMAIL_ALREADY_LINKED_ERROR,
+      });
     }
 
     const crossProviderRelink =
@@ -645,9 +649,8 @@ export async function handleLinkAccount(account: Account) {
         }),
       ]);
 
-      await clearSpecificErrorMessages({
+      await clearAccountDisconnectedErrorIfResolved({
         userId: account.userId,
-        errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
         logger,
       });
 
@@ -688,9 +691,8 @@ export async function handleLinkAccount(account: Account) {
       }),
     ]);
 
-    await clearSpecificErrorMessages({
+    await clearAccountDisconnectedErrorIfResolved({
       userId: account.userId,
-      errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
       logger,
     });
 

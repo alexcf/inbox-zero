@@ -12,6 +12,7 @@ import { type SubmitHandler, useFieldArray, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { usePostHog } from "posthog-js/react";
 import { env } from "@/env";
+import { isDeleteEmailActionEnabled } from "@/utils/delete-email-action";
 import {
   PencilIcon,
   TrashIcon,
@@ -49,7 +50,7 @@ import {
 } from "@/components/ui/collapsible";
 import { Form } from "@/components/ui/form";
 import { cn } from "@/utils";
-import { getActionIcon } from "@/utils/action-display";
+import { ACTION_TYPE_LABELS, getActionIcon } from "@/utils/action-display";
 import { useFolders } from "@/hooks/useFolders";
 import { isConversationStatusType } from "@/utils/reply-tracker/conversation-status-config";
 import { RuleSectionCard } from "@/app/(app)/[emailAccountId]/assistant/RuleSectionCard";
@@ -920,11 +921,15 @@ function restorePersistedActionSequence({
 }
 
 function getRuleEditorActions(actions: CreateRuleBody["actions"]) {
+  let filteredActions = actions;
+
   if (env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED === false) {
-    return actions.filter((action) => action.type !== ActionType.CALL_WEBHOOK);
+    filteredActions = filteredActions.filter(
+      (action) => action.type !== ActionType.CALL_WEBHOOK,
+    );
   }
 
-  return actions;
+  return filteredActions;
 }
 
 type ActionTypeOption = {
@@ -959,7 +964,7 @@ export function getRuleActionTypeOptions({
     ...(availableActions.has(ActionType.MOVE_FOLDER)
       ? [
           {
-            label: "Move to folder",
+            label: ACTION_TYPE_LABELS[ActionType.MOVE_FOLDER],
             value: ActionType.MOVE_FOLDER,
           },
         ]
@@ -967,27 +972,36 @@ export function getRuleActionTypeOptions({
     ...(availableActions.has(ActionType.DRAFT_EMAIL)
       ? [
           {
-            label: "Draft reply",
+            label: ACTION_TYPE_LABELS[ActionType.DRAFT_EMAIL],
             value: ActionType.DRAFT_EMAIL,
           },
         ]
       : []),
     {
-      label: "Archive",
+      label: ACTION_TYPE_LABELS[ActionType.ARCHIVE],
       value: ActionType.ARCHIVE,
     },
+    ...(isDeleteEmailActionEnabled() ||
+    existingActionTypes.includes(ActionType.DELETE)
+      ? [
+          {
+            label: ACTION_TYPE_LABELS[ActionType.DELETE],
+            value: ActionType.DELETE,
+          },
+        ]
+      : []),
     {
-      label: "Mark read",
+      label: ACTION_TYPE_LABELS[ActionType.MARK_READ],
       value: ActionType.MARK_READ,
     },
     {
-      label: "Star",
+      label: ACTION_TYPE_LABELS[ActionType.STAR],
       value: ActionType.STAR,
     },
     ...(availableActions.has(ActionType.REPLY)
       ? [
           {
-            label: "Reply",
+            label: ACTION_TYPE_LABELS[ActionType.REPLY],
             value: ActionType.REPLY,
           },
         ]
@@ -995,7 +1009,7 @@ export function getRuleActionTypeOptions({
     ...(availableActions.has(ActionType.SEND_EMAIL)
       ? [
           {
-            label: "Send email",
+            label: ACTION_TYPE_LABELS[ActionType.SEND_EMAIL],
             value: ActionType.SEND_EMAIL,
           },
         ]
@@ -1003,19 +1017,19 @@ export function getRuleActionTypeOptions({
     ...(availableActions.has(ActionType.FORWARD)
       ? [
           {
-            label: "Forward",
+            label: ACTION_TYPE_LABELS[ActionType.FORWARD],
             value: ActionType.FORWARD,
           },
         ]
       : []),
     {
-      label: "Mark spam",
+      label: ACTION_TYPE_LABELS[ActionType.MARK_SPAM],
       value: ActionType.MARK_SPAM,
     },
     ...(extraActions.has(ActionType.CALL_WEBHOOK)
       ? [
           {
-            label: "Call webhook",
+            label: ACTION_TYPE_LABELS[ActionType.CALL_WEBHOOK],
             value: ActionType.CALL_WEBHOOK,
           },
         ]
@@ -1025,7 +1039,7 @@ export function getRuleActionTypeOptions({
     existingActionTypes.includes(ActionType.NOTIFY_SENDER)
       ? [
           {
-            label: "Notify sender",
+            label: ACTION_TYPE_LABELS[ActionType.NOTIFY_SENDER],
             value: ActionType.NOTIFY_SENDER,
           },
         ]

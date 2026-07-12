@@ -34,7 +34,9 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { deleteRuleAction, toggleRuleAction } from "@/utils/actions/rule";
+import { setMemberOrganizationRuleEnabledAction } from "@/utils/actions/organization-rule";
 import { Badge } from "@/components/Badge";
+import { Tooltip } from "@/components/Tooltip";
 import { getActionColor } from "@/components/PlanBadge";
 import { toastError } from "@/components/Toast";
 import { useRules } from "@/hooks/useRules";
@@ -87,6 +89,48 @@ export function Rules({
   const { executeAsync: toggleRule } = useAction(
     toggleRuleAction.bind(null, emailAccountId),
   );
+  const { executeAsync: toggleMemberOrgRule } = useAction(
+    setMemberOrganizationRuleEnabledAction.bind(null, emailAccountId),
+  );
+
+  const handleToggle = async (
+    rule: RulesResponse[number],
+    enabled: boolean,
+  ) => {
+    const isOrgManaged = !!rule.organizationRuleId;
+    const isSystemRule = !!rule.systemType;
+
+    mutate(
+      data?.map((r) => {
+        if (isOrgManaged) {
+          return r.id === rule.id
+            ? { ...r, organizationRuleMemberEnabled: enabled, enabled }
+            : r;
+        }
+        if (isSystemRule) {
+          return r.systemType === rule.systemType ? { ...r, enabled } : r;
+        }
+        return r.id === rule.id ? { ...r, enabled } : r;
+      }),
+      { revalidate: false },
+    );
+
+    const result = isOrgManaged
+      ? await toggleMemberOrgRule({ ruleId: rule.id, enabled })
+      : await toggleRule({
+          ruleId: isSystemRule ? undefined : rule.id,
+          systemType: rule.systemType || undefined,
+          enabled,
+        });
+
+    if (result?.serverError) {
+      toastError({
+        description: `There was an error ${enabled ? "enabling" : "disabling"} the rule. ${result.serverError || ""}`,
+      });
+    }
+
+    mutate();
+  };
 
   const rules: RulesResponse = useMemo(() => {
     const existingRules = data || [];
@@ -124,6 +168,9 @@ export function Rules({
         subject: null,
         body: null,
         promptText: null,
+        organizationRuleId: null,
+        organizationRuleMemberEnabled: null,
+        organizationRule: null,
       };
     });
 
@@ -201,66 +248,52 @@ export function Rules({
                 )}
                 {filteredRules.map((rule) => {
                   const isPlaceholder = rule.id.startsWith("placeholder-");
+                  const isOrgManaged = !!rule.organizationRuleId;
+                  const isDisabledByOrg =
+                    isOrgManaged && rule.organizationRule?.enabled === false;
 
                   return (
                     <TableRow
                       key={rule.id}
                       className={`${!rule.enabled ? "bg-muted opacity-60" : ""} ${
-                        isPlaceholder ? "cursor-default" : "cursor-pointer"
+                        isPlaceholder || isOrgManaged
+                          ? "cursor-default"
+                          : "cursor-pointer"
                       }`}
                       onClick={() => {
-                        if (isPlaceholder) return;
-                        ruleDialog.onOpen({
-                          ruleId: rule.id,
-                          editMode: false,
-                        });
+                        if (isPlaceholder || isOrgManaged) return;
+                        ruleDialog.onOpen({ ruleId: rule.id, editMode: false });
                       }}
                     >
                       <TableCell
                         onClick={(e) => e.stopPropagation()}
                         className="text-center p-2 sm:p-4"
                       >
-                        <Switch
-                          size="sm"
-                          checked={rule.enabled}
-                          onCheckedChange={async (enabled) => {
-                            const isSystemRule = !!rule.systemType;
-
-                            // Optimistic update
-                            mutate(
-                              data?.map((r) =>
-                                isSystemRule
-                                  ? r.systemType === rule.systemType
-                                    ? { ...r, enabled }
-                                    : r
-                                  : r.id === rule.id
-                                    ? { ...r, enabled }
-                                    : r,
-                              ),
-                              { revalidate: false },
-                            );
-
-                            const result = await toggleRule({
-                              ruleId: isSystemRule ? undefined : rule.id,
-                              systemType: rule.systemType || undefined,
-                              enabled,
-                            });
-
-                            if (result?.serverError) {
-                              toastError({
-                                description: `There was an error ${
-                                  enabled ? "enabling" : "disabling"
-                                } your rule. ${result.serverError || ""}`,
-                              });
-                            }
-
-                            // Revalidate to sync with server
-                            mutate();
-                          }}
-                        />
+                        <Tooltip
+                          content="Disabled by your organization"
+                          hide={!isDisabledByOrg}
+                        >
+                          <span>
+                            <Switch
+                              size="sm"
+                              checked={rule.enabled}
+                              disabled={isDisabledByOrg}
+                              onCheckedChange={(enabled) =>
+                                handleToggle(rule, enabled)
+                              }
+                            />
+                          </span>
+                        </Tooltip>
                       </TableCell>
                       <TableCell className="font-medium p-2 sm:p-4">
-                        {rule.name}
+                        <div className="flex items-center gap-2">
+                          {rule.name}
+                          {isOrgManaged && (
+                            <Tooltip content="Managed by Organization">
+                              <Badge color="blue">Org</Badge>
+                            </Tooltip>
+                          )}
+                        </div>
                       </TableCell>
                       <TableCell className="hidden sm:table-cell p-2 sm:p-4">
                         <TruncatedTooltipText
@@ -294,38 +327,45 @@ export function Rules({
                               align="end"
                               onClick={(e) => e.stopPropagation()}
                             >
-                              <DropdownMenuItem
-                                onClick={() => {
-                                  ruleDialog.onOpen({
-                                    ruleId: rule.id,
-                                    editMode: true,
-                                  });
-                                }}
-                              >
-                                <PenIcon className="mr-2 size-4" />
-                                Edit manually
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onClick={() => {
-                                  setInput(
-                                    `I'd like to edit the "${rule.name}" rule:\n`,
-                                  );
-                                  setOpen((arr) => [...arr, "chat-sidebar"]);
-                                }}
-                              >
-                                <SparklesIcon className="mr-2 size-4" />
-                                Edit via AI
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onClick={() => {
-                                  ruleDialog.onOpen({
-                                    duplicateRule: rule,
-                                  });
-                                }}
-                              >
-                                <CopyIcon className="mr-2 size-4" />
-                                Duplicate
-                              </DropdownMenuItem>
+                              {!isOrgManaged && (
+                                <>
+                                  <DropdownMenuItem
+                                    onClick={() => {
+                                      ruleDialog.onOpen({
+                                        ruleId: rule.id,
+                                        editMode: true,
+                                      });
+                                    }}
+                                  >
+                                    <PenIcon className="mr-2 size-4" />
+                                    Edit manually
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onClick={() => {
+                                      setInput(
+                                        `I'd like to edit the "${rule.name}" rule:\n`,
+                                      );
+                                      setOpen((arr) => [
+                                        ...arr,
+                                        "chat-sidebar",
+                                      ]);
+                                    }}
+                                  >
+                                    <SparklesIcon className="mr-2 size-4" />
+                                    Edit via AI
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    onClick={() => {
+                                      ruleDialog.onOpen({
+                                        duplicateRule: rule,
+                                      });
+                                    }}
+                                  >
+                                    <CopyIcon className="mr-2 size-4" />
+                                    Duplicate
+                                  </DropdownMenuItem>
+                                </>
+                              )}
                               <DropdownMenuItem asChild>
                                 <Link
                                   href={prefixPath(
@@ -337,7 +377,7 @@ export function Rules({
                                   History
                                 </Link>
                               </DropdownMenuItem>
-                              {!rule.systemType && (
+                              {!rule.systemType && !isOrgManaged && (
                                 <>
                                   <DropdownMenuSeparator />
 

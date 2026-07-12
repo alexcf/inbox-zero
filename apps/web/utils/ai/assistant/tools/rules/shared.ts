@@ -5,8 +5,14 @@ import type {
   CreateOrUpdateRuleSchema,
 } from "@/utils/ai/rule/create-rule-schema";
 import { posthogCaptureEvent } from "@/utils/posthog";
+import { RULE_MANAGED_BY_ORGANIZATION_ERROR } from "@/utils/organizations/rules";
 import { hideToolErrorFromUser } from "../../tool-error-visibility";
-import type { RuleReadState } from "../../chat-rule-state";
+import {
+  type AssistantRuleSnapshot,
+  buildRuleReadState,
+  loadAssistantRuleSnapshot,
+  type RuleReadState,
+} from "../../chat-rule-state";
 
 export const emptyInputSchema = z.object({});
 
@@ -87,6 +93,30 @@ export async function trackRuleToolCall({
   return posthogCaptureEvent(email, "AI Assistant Chat Tool Call", { tool });
 }
 
+export async function loadRuleSnapshotAfterWrite({
+  emailAccountId,
+  logger,
+  setRuleReadState,
+  onRulesStateExposed,
+}: {
+  emailAccountId: string;
+  logger: Logger;
+  setRuleReadState?: (state: RuleReadState) => void;
+  onRulesStateExposed?: (rulesRevision: number) => void;
+}): Promise<AssistantRuleSnapshot | null> {
+  try {
+    const snapshot = await loadAssistantRuleSnapshot({ emailAccountId });
+    setRuleReadState?.(buildRuleReadState(snapshot));
+    onRulesStateExposed?.(snapshot.rulesRevision);
+    return snapshot;
+  } catch (error) {
+    logger.warn("Failed to refresh rule read state after rule write", {
+      error,
+    });
+    return null;
+  }
+}
+
 export function validateRuleWasReadRecently({
   ruleName,
   getRuleReadState,
@@ -136,4 +166,11 @@ export function buildHiddenRuleNotFoundError() {
     success: false,
     error: RULE_NOT_FOUND_ERROR,
   });
+}
+
+export function buildVisibleOrgManagedRuleError() {
+  return {
+    success: false as const,
+    error: RULE_MANAGED_BY_ORGANIZATION_ERROR,
+  };
 }

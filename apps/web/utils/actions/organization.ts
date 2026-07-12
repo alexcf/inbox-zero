@@ -7,13 +7,14 @@ import {
   inviteMembersBody,
   removeMemberBody,
   updateMemberRoleBody,
+  transferOwnershipBody,
   cancelInvitationBody,
   handleInvitationBody,
   updateAnalyticsConsentBody,
   createOrganizationAndInviteBody,
 } from "@/utils/actions/organization.validation";
 import prisma from "@/utils/prisma";
-import { SafeError } from "@/utils/error";
+import { captureException, SafeError } from "@/utils/error";
 import { getAuthorizedOrganizationAdminMembership } from "@/utils/organizations/access";
 import { sendOrganizationInvitation } from "@/utils/organizations/invitations";
 import {
@@ -24,6 +25,11 @@ import {
 import { env } from "@/env";
 import { slugify } from "@/utils/string";
 import { posthogCaptureEvent } from "@/utils/posthog";
+import { createScopedLogger } from "@/utils/logger";
+import {
+  deleteMemberOrganizationRuleCopies,
+  syncOrganizationRulesForNewMember,
+} from "@/utils/organizations/rules";
 
 export const createOrganizationAction = actionClient
   .metadata({ name: "createOrganization" })
@@ -305,6 +311,31 @@ async function acceptInvitation({
     data: { status: "accepted" },
   });
 
+  // A sync failure must not block joining the organization, but it is surfaced
+  // (logged + captured) so the team can recover the member's missing rule copies.
+  const syncLogger = createScopedLogger("organizations/rules").with({
+    emailAccountId,
+    organizationId: invitation.organizationId,
+  });
+  try {
+    await syncOrganizationRulesForNewMember({
+      organizationId: invitation.organizationId,
+      emailAccountId,
+      logger: syncLogger,
+    });
+  } catch (error) {
+    syncLogger.error("Failed to materialize org rules for new member", {
+      error,
+    });
+    captureException(error, {
+      emailAccountId,
+      extra: {
+        organizationId: invitation.organizationId,
+        context: "syncOrganizationRulesForNewMember",
+      },
+    });
+  }
+
   const premium = await getOrganizationPremium(invitation.organizationId);
   if (premium) {
     const emailAccount = await getUserFromEmailAccount(emailAccountId);
@@ -357,6 +388,11 @@ export const removeMemberAction = actionClientUser
       }
     }
 
+    await deleteMemberOrganizationRuleCopies({
+      emailAccountId: targetMember.emailAccountId,
+      organizationId: targetMember.organizationId,
+    });
+
     await prisma.member.delete({ where: { id: memberId } });
   });
 
@@ -380,6 +416,61 @@ export const updateMemberRoleAction = actionClientUser
       select: { id: true, role: true },
     });
   });
+
+export const transferOwnershipAction = actionClientUser
+  .metadata({ name: "transferOwnership" })
+  .inputSchema(transferOwnershipBody)
+  .action(
+    async ({ ctx: { userId }, parsedInput: { organizationId, memberId } }) => {
+      const targetMember = await prisma.member.findUnique({
+        where: { id: memberId },
+        select: {
+          id: true,
+          emailAccountId: true,
+          organizationId: true,
+          role: true,
+        },
+      });
+
+      if (!targetMember || targetMember.organizationId !== organizationId) {
+        throw new SafeError("Member not found.");
+      }
+
+      const callerMembership = await prisma.member.findFirst({
+        where: {
+          organizationId,
+          role: "owner",
+          emailAccount: { userId },
+        },
+        select: { id: true, emailAccountId: true },
+      });
+
+      if (!callerMembership) {
+        throw new SafeError("Only organization owners can transfer ownership.");
+      }
+
+      if (targetMember.emailAccountId === callerMembership.emailAccountId) {
+        throw new SafeError("You already own this organization.");
+      }
+
+      if (targetMember.role === "owner") {
+        return { id: targetMember.id, role: targetMember.role };
+      }
+
+      await prisma.$transaction([
+        prisma.member.update({
+          where: { id: targetMember.id },
+          data: { role: "owner" },
+        }),
+        prisma.member.update({
+          where: { id: callerMembership.id },
+          data: { role: "admin" },
+        }),
+      ]);
+
+      return { id: targetMember.id, role: "owner" };
+    },
+  );
 
 export const cancelInvitationAction = actionClientUser
   .metadata({ name: "cancelInvitation" })

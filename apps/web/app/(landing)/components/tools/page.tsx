@@ -15,7 +15,7 @@ import {
   UpdatedRuleConditions,
   UpdatedRuleActions,
   UpdatedLearnedPatterns,
-  UpdatedRuleState,
+  UpdatedRule,
   ForwardEmailResult,
   ManageInboxResult,
   ManageSenderCategoryResult,
@@ -44,6 +44,7 @@ export default function ToolsPage() {
           <MutedText>Created rules:</MutedText>
           <CreatedRuleToolCard
             preview
+            status="created"
             args={{
               name: "Hiring",
               condition: {
@@ -60,6 +61,7 @@ export default function ToolsPage() {
           />
           <CreatedRuleToolCard
             preview
+            status="created"
             args={{
               name: "Newsletter Archive",
               condition: {
@@ -80,6 +82,7 @@ export default function ToolsPage() {
           />
           <CreatedRuleToolCard
             preview
+            status="created"
             args={{
               name: "Billing Alerts",
               condition: {
@@ -227,35 +230,39 @@ export default function ToolsPage() {
             ]}
           />
 
-          <MutedText>Updated rule state:</MutedText>
-          <UpdatedRuleState
+          <MutedText>Updated rule status:</MutedText>
+          <UpdatedRule
             preview
             args={{
               ruleName: "Newsletter Archive",
-              operation: "disable",
+              updates: {
+                enabled: false,
+              },
             }}
             output={{
               success: true,
               ruleId: "demo-rule",
-              ruleName: "Newsletter Archive",
-              operation: "disable",
-              enabled: false,
-              previousEnabled: true,
+              originalName: "Newsletter Archive",
+              updatedName: "Newsletter Archive",
+              originalEnabled: true,
+              updatedEnabled: false,
             }}
           />
-          <UpdatedRuleState
+          <UpdatedRule
             preview
             args={{
               ruleName: "Billing Alerts",
-              operation: "enable",
+              updates: {
+                enabled: true,
+              },
             }}
             output={{
               success: true,
               ruleId: "demo-rule",
-              ruleName: "Billing Alerts",
-              operation: "enable",
-              enabled: true,
-              previousEnabled: false,
+              originalName: "Billing Alerts",
+              updatedName: "Billing Alerts",
+              originalEnabled: false,
+              updatedEnabled: true,
             }}
           />
 
@@ -263,7 +270,6 @@ export default function ToolsPage() {
           <PendingDeleteRulePreviewCard
             args={{
               ruleName: "Old Vendor Alerts",
-              operation: "delete",
             }}
             output={{
               success: true,

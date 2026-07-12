@@ -13,7 +13,10 @@ import { Progress } from "@/components/ui/progress";
 import { ButtonCheckbox } from "@/components/ButtonCheckbox";
 import { DomainIcon } from "@/components/charts/DomainIcon";
 import { BulkUnsubscribeIllustration } from "@/app/(app)/[emailAccountId]/onboarding/illustrations/BulkUnsubscribeIllustration";
-import { getUnsubscribeSuggestions } from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/suggestions";
+import {
+  getUnsubscribeSuggestions,
+  hasAutomaticUnsubscribeLink,
+} from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/suggestions";
 import { useBulkUnsubscribe } from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/hooks";
 import type {
   NewsletterStatsQuery,
@@ -24,6 +27,7 @@ import { usePremium } from "@/hooks/usePremium";
 import { usePremiumModal } from "@/app/(app)/premium/PremiumModal";
 import { useOnboardingBulkUnsubscribeVariant } from "@/hooks/useFeatureFlags";
 import { extractDomainFromEmail } from "@/utils/email";
+import { createSearchParams } from "@/utils/url";
 
 type Newsletter = NewsletterStatsResponse["newsletters"][number];
 
@@ -55,8 +59,7 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
     includeMissingUnsubscribe: true,
     fromDate,
   };
-  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
-  const urlParams = new URLSearchParams(params as any);
+  const urlParams = createSearchParams(params);
   const { data, isLoading, mutate } = useSWR<NewsletterStatsResponse>(
     // Only fetch in the treatment arm; control never renders the list.
     isTreatment && emailAccountId
@@ -69,13 +72,24 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
     },
   );
 
-  const suggestions = useMemo(
+  const lowReadSuggestions = useMemo(
     () => getUnsubscribeSuggestions(data?.newsletters ?? []),
+    [data],
+  );
+  const suggestions = useMemo(
+    () =>
+      getUnsubscribeSuggestions(data?.newsletters ?? [], {
+        requireAutomaticUnsubscribeLink: true,
+      }),
     [data],
   );
   const previewSenders = useMemo(
     () => suggestions.slice(0, PREVIEW_COUNT),
     [suggestions],
+  );
+  const lowReadSuggestionsWithAutomaticUnsubscribe = useMemo(
+    () => lowReadSuggestions.filter(hasAutomaticUnsubscribeLink).length,
+    [lowReadSuggestions],
   );
 
   // Track which previewed senders the user opted out of, so selection needs no
@@ -107,11 +121,18 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
       variant,
       shownCount: previewSenders.length,
       totalSuggestions: suggestions.length,
+      lowReadSuggestionCount: lowReadSuggestions.length,
+      lowReadSuggestionWithAutomaticUnsubscribeCount:
+        lowReadSuggestionsWithAutomaticUnsubscribe,
+      lowReadSuggestionMissingAutomaticUnsubscribeCount:
+        lowReadSuggestions.length - lowReadSuggestionsWithAutomaticUnsubscribe,
     });
   }, [
     isTreatment,
     previewSenders.length,
     suggestions.length,
+    lowReadSuggestions.length,
+    lowReadSuggestionsWithAutomaticUnsubscribe,
     variant,
     posthog,
   ]);
@@ -154,7 +175,20 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
       onSkip();
       return;
     }
+
+    posthog?.capture("onboarding_unsubscribe_cta_clicked", {
+      variant,
+      selectedCount: selectedSenders.length,
+      totalSuggestions: suggestions.length,
+      hasUnsubscribeAccess,
+    });
+
     if (!hasUnsubscribeAccess) {
+      posthog?.capture("onboarding_unsubscribe_upgrade_prompt_shown", {
+        variant,
+        selectedCount: selectedSenders.length,
+        totalSuggestions: suggestions.length,
+      });
       openModal();
       return;
     }
@@ -177,7 +211,7 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
   const hasMore = suggestions.length > previewSenders.length;
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 px-4 py-10">
+    <div className="flex min-h-svh flex-col items-center justify-center bg-slate-50 px-4 py-10">
       <div className="w-full max-w-xl">
         <div className="mb-6 text-center">
           <PageHeading className="mb-3">
@@ -252,7 +286,7 @@ export function StepBulkUnsubscribe({ onNext }: { onNext: () => void }) {
 
 function StaticBulkUnsubscribeStep({ onNext }: { onNext: () => void }) {
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 px-4">
+    <div className="flex min-h-svh flex-col items-center justify-center bg-slate-50 px-4 py-8">
       <div className="flex flex-col items-center text-center max-w-md">
         <div className="mb-6 h-[240px] flex items-end justify-center">
           <BulkUnsubscribeIllustration />
