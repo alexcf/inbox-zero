@@ -81,7 +81,7 @@ function withMiddleware<T extends NextRequest>(
     const requestId = getRequestId(req.headers.get("x-request-id"));
     const baseLogger = createScopedLogger(scope || "api").with({
       requestId,
-      url: req.url,
+      url: getRequestPath(req),
     });
     const requestTimer =
       options?.requestTiming !== undefined
@@ -173,7 +173,7 @@ function withMiddleware<T extends NextRequest>(
 
           const apiError = checkCommonErrors(
             error,
-            requestForError.url,
+            getRequestPath(requestForError),
             reqLogger,
           );
           if (apiError) {
@@ -187,7 +187,7 @@ function withMiddleware<T extends NextRequest>(
 
             await logErrorToPosthog(
               "api",
-              requestForError.url,
+              getRequestPath(requestForError),
               apiError.type,
               "unknown",
               reqLogger,
@@ -226,7 +226,9 @@ function withMiddleware<T extends NextRequest>(
                 : undefined,
             stack: error instanceof Error ? error.stack : undefined,
           });
-          captureException(error, { extra: { url: requestForError.url } });
+          captureException(error, {
+            extra: { url: getRequestPath(requestForError) },
+          });
 
           return NextResponse.json(
             { error: "An unexpected error occurred" },
@@ -284,7 +286,7 @@ async function authMiddleware(
     );
   }
 
-  const authReq = req.clone() as RequestWithAuth;
+  const authReq = req as RequestWithAuth;
   authReq.auth = { userId: session.user.id };
 
   authReq.logger = baseLogger.with({ userId: session.user.id });
@@ -398,7 +400,7 @@ async function emailAccountMiddleware(
           userId,
         });
 
-        const emailAccountReq = req.clone() as RequestWithEmailAccount;
+        const emailAccountReq = authReq as RequestWithEmailAccount;
         emailAccountReq.auth = {
           userId,
           emailAccountId,
@@ -428,8 +430,7 @@ async function emailAccountMiddleware(
       userId,
     });
 
-    // Create a new request with email account info
-    const emailAccountReq = req.clone() as RequestWithEmailAccount;
+    const emailAccountReq = authReq as RequestWithEmailAccount;
     emailAccountReq.auth = { userId, emailAccountId, email };
     emailAccountReq.logger = emailAccountLogger;
 
@@ -451,9 +452,6 @@ async function emailProviderMiddleware(
   if (emailAccountReq instanceof Response) return emailAccountReq;
 
   const { userId, emailAccountId } = emailAccountReq.auth;
-  const reqWithAuth = req as RequestWithEmailAccount;
-  reqWithAuth.auth = emailAccountReq.auth;
-  reqWithAuth.logger = emailAccountReq.logger;
   const middlewareStartTime = Date.now();
 
   try {
@@ -494,7 +492,7 @@ async function emailProviderMiddleware(
         }),
     });
 
-    const providerReq = emailAccountReq.clone() as RequestWithEmailProvider;
+    const providerReq = emailAccountReq as RequestWithEmailProvider;
     providerReq.auth = emailAccountReq.auth;
     providerReq.emailProvider = provider;
     providerReq.logger = emailAccountReq.logger;
@@ -693,12 +691,16 @@ function getRequestId(rawRequestId: string | null) {
   return randomUUID();
 }
 
+function getRequestPath(req: NextRequest) {
+  return req.nextUrl.pathname;
+}
+
 function flushLogger(req: NextRequest) {
   const reqWithLogger = req as RequestWithLogger;
   if (reqWithLogger.logger) {
     const loggerToFlush = reqWithLogger.logger;
     after(async () => {
-      await flushLoggerSafely(loggerToFlush, { url: req.url });
+      await flushLoggerSafely(loggerToFlush, { url: getRequestPath(req) });
     });
   }
 }

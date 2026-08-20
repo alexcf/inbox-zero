@@ -15,6 +15,48 @@ import {
 import type { OutlookClient } from "@/utils/outlook/client";
 
 describe("convertMessage", () => {
+  it("excludes inline images embedded in the email body from attachments", () => {
+    const message: Message = {
+      id: "msg-123",
+      conversationId: "thread-456",
+      attachments: [
+        {
+          id: "inline-attachment",
+          name: "signature-logo.png",
+          contentType: "image/png",
+          contentId: "signature-logo",
+          size: 128,
+          isInline: true,
+        },
+        {
+          id: "document-attachment",
+          name: "receipt.pdf",
+          contentType: "application/pdf",
+          size: 1024,
+          isInline: false,
+        },
+      ],
+    };
+
+    const result = convertMessage(message, {});
+
+    expect(result.attachments).toEqual([
+      expect.objectContaining({
+        attachmentId: "document-attachment",
+        filename: "receipt.pdf",
+      }),
+    ]);
+    expect(result.inline).toEqual([
+      expect.objectContaining({
+        attachmentId: "inline-attachment",
+        filename: "signature-logo.png",
+        headers: expect.objectContaining({
+          "content-id": "signature-logo",
+        }),
+      }),
+    ]);
+  });
+
   describe("category ID mapping", () => {
     it("should return category IDs when categoryMap is provided", () => {
       const message: Message = {

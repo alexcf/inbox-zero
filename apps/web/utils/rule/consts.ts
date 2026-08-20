@@ -157,19 +157,6 @@ export function getCategoryAction(systemType: SystemType, provider: string) {
   return config.categoryAction;
 }
 
-export const SYSTEM_RULE_ORDER: SystemType[] = [
-  SystemType.TO_REPLY,
-  SystemType.AWAITING_REPLY,
-  SystemType.FYI,
-  SystemType.ACTIONED,
-  SystemType.NEWSLETTER,
-  SystemType.MARKETING,
-  SystemType.CALENDAR,
-  SystemType.RECEIPT,
-  SystemType.NOTIFICATION,
-  SystemType.COLD_EMAIL,
-];
-
 export function getDefaultActions(
   systemType: SystemType,
   provider: string,
@@ -190,6 +177,9 @@ export function getDefaultActions(
   messagingChannelId: string | null;
   delayInMinutes: number | null;
   staticAttachments: null;
+  integrationName: string | null;
+  integrationToolName: string | null;
+  integrationArgs: null;
   createdAt: Date;
   updatedAt: Date;
 }> {
@@ -213,6 +203,9 @@ export function getDefaultActions(
     messagingChannelId: string | null;
     delayInMinutes: number | null;
     staticAttachments: null;
+    integrationName: string | null;
+    integrationToolName: string | null;
+    integrationArgs: null;
     createdAt: Date;
     updatedAt: Date;
   }> = [];
@@ -235,6 +228,9 @@ export function getDefaultActions(
       messagingChannelId: null,
       delayInMinutes: null,
       staticAttachments: null,
+      integrationName: null,
+      integrationToolName: null,
+      integrationArgs: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -256,6 +252,9 @@ export function getDefaultActions(
       messagingChannelId: null,
       delayInMinutes: null,
       staticAttachments: null,
+      integrationName: null,
+      integrationToolName: null,
+      integrationArgs: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -279,6 +278,9 @@ export function getDefaultActions(
       messagingChannelId: null,
       delayInMinutes: null,
       staticAttachments: null,
+      integrationName: null,
+      integrationToolName: null,
+      integrationArgs: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -302,6 +304,9 @@ export function getDefaultActions(
       messagingChannelId: null,
       delayInMinutes: null,
       staticAttachments: null,
+      integrationName: null,
+      integrationToolName: null,
+      integrationArgs: null,
       createdAt: now,
       updatedAt: now,
     });

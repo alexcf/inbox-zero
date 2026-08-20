@@ -156,7 +156,7 @@ describe("OutlookProvider.getSentMessageIds", () => {
     });
 
     expect(client.getRequestLog()).toContainEqual({
-      apiPath: "/me/mailFolders('sentitems')/messages",
+      apiPath: "/me/mailFolders/sentitems/messages",
       filter:
         "sentDateTime ge 2026-03-31T12:00:00.000Z and sentDateTime le 2026-04-30T17:00:00.000Z",
     });
@@ -168,6 +168,53 @@ describe("OutlookProvider.getSentMessageIds", () => {
 });
 
 describe("OutlookProvider.getThreadsWithQuery", () => {
+  it("omits message bodies from metadata list requests", async () => {
+    const client = createMockOutlookClient([
+      createMessage({ id: "message-1", conversationId: "thread-1" }),
+    ]);
+    const provider = new OutlookProvider(client);
+
+    await provider.getThreadsWithQuery({ messageFormat: "metadata" });
+
+    expect(client.getSelectLog()[0]).toContain("bodyPreview");
+    expect(client.getSelectLog()[0]?.split(",")).not.toContain("body");
+  });
+
+  it.each([
+    "focused",
+    "other",
+  ] as const)("queries the Outlook inbox's %s section", async (inboxSection) => {
+    const client = createMockOutlookClient([
+      createMessage({ id: `${inboxSection}-message` }),
+    ]);
+    const provider = new OutlookProvider(client);
+
+    await provider.getThreadsWithQuery({
+      query: { type: "inbox", inboxSection },
+    });
+
+    expect(client.getRequestLog()[0]).toEqual({
+      apiPath: "/me/mailFolders/inbox/messages",
+      filter: `inferenceClassification eq '${inboxSection}'`,
+    });
+  });
+
+  it("does not apply an inbox section filter to a custom folder", async () => {
+    const client = createMockOutlookClient([
+      createMessage({ id: "folder-message" }),
+    ]);
+    const provider = new OutlookProvider(client);
+
+    await provider.getThreadsWithQuery({
+      query: { folderId: "custom-folder", inboxSection: "focused" },
+    });
+
+    expect(client.getRequestLog()[0]).toEqual({
+      apiPath: "/me/mailFolders/custom-folder/messages",
+      filter: undefined,
+    });
+  });
+
   it("filters returned threads by explicit labelIds", async () => {
     getFolderIdsMock.mockResolvedValue({
       inbox: "folder-inbox",
@@ -209,6 +256,45 @@ describe("OutlookProvider.getThreadsWithQuery", () => {
     expect(result.threads.map((thread) => thread.id)).toEqual([
       "thread-with-label",
     ]);
+  });
+
+  it("uses multiple label IDs in preference to the legacy single label", async () => {
+    getFolderIdsMock.mockResolvedValue({
+      inbox: "folder-inbox",
+      archive: "folder-archive",
+      drafts: "folder-drafts",
+      deleteditems: "folder-trash",
+      junkemail: "folder-spam",
+      sentitems: "folder-sent",
+    });
+    vi.spyOn(outlookMessageModule, "getCategoryMap").mockResolvedValue(
+      new Map([["To Reply", "label-to-reply"]]),
+    );
+    const client = createMockOutlookClient([
+      createMessage({
+        id: "inbox-message",
+        conversationId: "inbox-thread",
+        categories: ["To Reply"],
+        parentFolderId: "folder-inbox",
+      }),
+      createMessage({
+        id: "archived-message",
+        conversationId: "archived-thread",
+        categories: ["To Reply"],
+        parentFolderId: "folder-archive",
+      }),
+    ]);
+    const provider = new OutlookProvider(client);
+
+    const result = await provider.getThreadsWithQuery({
+      query: {
+        labelId: "ARCHIVE",
+        labelIds: ["label-to-reply", "INBOX"],
+      },
+    });
+
+    expect(result.threads.map((thread) => thread.id)).toEqual(["inbox-thread"]);
+    expect(client.getRequestLog()[0]?.filter).toBeUndefined();
   });
 
   it("keeps paging until explicit labelIds produce enough matching threads", async () => {
@@ -740,6 +826,7 @@ function createMockOutlookClient(
   let categoryMapCache = options?.categoryMapCache ?? null;
   let folderIdCache = options?.folderIdCache ?? null;
   const requestLog: Array<{ apiPath: string; filter?: string }> = [];
+  const selectLog: string[] = [];
 
   return {
     getClient: () => ({
@@ -755,7 +842,10 @@ function createMockOutlookClient(
             searchValue = value;
             return request;
           },
-          select: () => request,
+          select: (value: string) => {
+            selectLog.push(value);
+            return request;
+          },
           expand: () => request,
           top: () => request,
           orderby: () => request,
@@ -784,6 +874,7 @@ function createMockOutlookClient(
       folderIdCache = value;
     },
     getRequestLog: () => requestLog,
+    getSelectLog: () => selectLog,
   } as any;
 }
 
@@ -847,3 +938,61 @@ function createMessage(input: {
     hasAttachments: false,
   };
 }
+
+describe("OutlookProvider.createDraft", () => {
+  it("addresses every recipient in a comma-separated list", async () => {
+    const post = vi.fn().mockResolvedValue({ id: "draft-1" });
+    const provider = new OutlookProvider(
+      { getClient: () => ({ api: () => ({ post }) }) } as never,
+      createTestLogger(),
+    );
+
+    await provider.createDraft({
+      to: "Alice <alice@example.com>, bob@example.com",
+      subject: "Notes from our call",
+      messageHtml: "<p>Thanks all</p>",
+    });
+
+    expect(post.mock.calls[0]?.[0]?.toRecipients).toEqual([
+      { emailAddress: { address: "alice@example.com" } },
+      { emailAddress: { address: "bob@example.com" } },
+    ]);
+  });
+
+  it("drops recipients without a parseable email address", async () => {
+    const post = vi.fn().mockResolvedValue({ id: "draft-1" });
+    const provider = new OutlookProvider(
+      { getClient: () => ({ api: () => ({ post }) }) } as never,
+      createTestLogger(),
+    );
+
+    await provider.createDraft({
+      to: "Alice <alice@example.com>, not-an-email, bob@example.com",
+      subject: "Notes from our call",
+      messageHtml: "<p>Thanks all</p>",
+    });
+
+    expect(post.mock.calls[0]?.[0]?.toRecipients).toEqual([
+      { emailAddress: { address: "alice@example.com" } },
+      { emailAddress: { address: "bob@example.com" } },
+    ]);
+  });
+
+  it("throws when no recipient has a parseable email address", async () => {
+    const post = vi.fn().mockResolvedValue({ id: "draft-1" });
+    const provider = new OutlookProvider(
+      { getClient: () => ({ api: () => ({ post }) }) } as never,
+      createTestLogger(),
+    );
+
+    await expect(
+      provider.createDraft({
+        to: "not-an-email, also invalid",
+        subject: "Notes from our call",
+        messageHtml: "<p>Thanks all</p>",
+      }),
+    ).rejects.toThrow("No valid recipient email addresses");
+
+    expect(post).not.toHaveBeenCalled();
+  });
+});

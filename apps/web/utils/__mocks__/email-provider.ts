@@ -48,6 +48,7 @@ export const createMockEmailProvider = (
   getLabelByName: vi.fn().mockResolvedValue(null),
   getMessageByRfc822MessageId: vi.fn().mockResolvedValue(null),
   getFolders: vi.fn().mockResolvedValue([]),
+  getFolderCounts: vi.fn().mockResolvedValue([]),
   getSignatures: vi.fn().mockResolvedValue([]),
   getInboxStats: vi.fn().mockResolvedValue({ total: 0, unread: 0 }),
   getMessage: vi.fn().mockResolvedValue({
@@ -78,8 +79,14 @@ export const createMockEmailProvider = (
   getPreviousConversationMessages: vi.fn().mockResolvedValue([]),
   archiveThread: vi.fn().mockResolvedValue(undefined),
   archiveThreadWithLabel: vi.fn().mockResolvedValue(undefined),
+  bulkArchiveThreads: vi.fn().mockResolvedValue({
+    succeededThreadIds: [],
+    failedThreadIds: [],
+  }),
   archiveMessage: vi.fn().mockResolvedValue(undefined),
   trashThread: vi.fn().mockResolvedValue(undefined),
+  unarchiveThread: vi.fn().mockResolvedValue(undefined),
+  untrashThread: vi.fn().mockResolvedValue(undefined),
   bulkArchiveFromSenders: vi.fn().mockResolvedValue(undefined),
   bulkTrashFromSenders: vi.fn().mockResolvedValue(undefined),
   labelMessage: vi.fn().mockResolvedValue(undefined),
@@ -116,6 +123,13 @@ export const createMockEmailProvider = (
   getMessagesWithPagination: vi
     .fn()
     .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+  getMailboxSyncPage: vi.fn().mockResolvedValue({
+    cursor: "sync-cursor",
+    deletedMessageIds: [],
+    hasMore: false,
+    reset: false,
+    upsertedMessages: [],
+  }),
   searchMessages: vi
     .fn()
     .mockResolvedValue({ messages: [], nextPageToken: undefined }),

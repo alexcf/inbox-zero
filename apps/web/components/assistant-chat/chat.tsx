@@ -3,12 +3,10 @@
 import type { ChangeEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowUpIcon,
   HistoryIcon,
   Loader2,
   PaperclipIcon,
   PlusIcon,
-  SquareIcon,
   XIcon,
 } from "lucide-react";
 import { Messages } from "./messages";
@@ -191,7 +189,7 @@ export function Chat({
     <PromptInput
       onSubmit={(e) => {
         e.preventDefault();
-        if (hasContent && status === "ready") {
+        if (hasContent && (status === "ready" || status === "error")) {
           analytics.captureAction("chat_message_submitted", {
             has_text: input.trim().length > 0,
             attachment_count: attachments.length,
@@ -199,10 +197,8 @@ export function Chat({
             message_count: messages.length,
           });
           handleSubmit();
-          setLocalStorageInput("");
         }
       }}
-      className="relative divide-y-0 rounded-2xl"
     >
       {(attachments.length > 0 || uploadQueue.length > 0) && (
         <div className="flex gap-2 overflow-x-auto p-2 pb-0">
@@ -273,8 +269,9 @@ export function Chat({
                 ? "submitted"
                 : "ready"
           }
-          disabled={status === "ready" ? !hasContent : status === "error"}
-          className="h-9 w-9 rounded-full bg-blue-500 text-white hover:bg-blue-600"
+          disabled={
+            status === "ready" || status === "error" ? !hasContent : false
+          }
           onClick={(e) => {
             if (status === "streaming" || status === "submitted") {
               analytics.captureAction("chat_generation_stopped", {
@@ -285,15 +282,7 @@ export function Chat({
               setMessages((messages) => messages);
             }
           }}
-        >
-          {status === "submitted" ? (
-            <Loader2 className="size-5 animate-spin" />
-          ) : status === "streaming" ? (
-            <SquareIcon className="size-4" />
-          ) : (
-            <ArrowUpIcon className="size-5" />
-          )}
-        </PromptInputSubmit>
+        />
       </div>
     </PromptInput>
   );

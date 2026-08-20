@@ -23,6 +23,7 @@ const {
   mockStartBulkCategorization,
   mockGetCategorizationProgress,
   mockGetCategorizationStatusSnapshot,
+  mockIsIntegrationActionEnabledForUserId,
 } = vi.hoisted(() => ({
   envState: {
     sendEmailEnabled: true,
@@ -64,6 +65,7 @@ const {
   mockStartBulkCategorization: vi.fn(),
   mockGetCategorizationProgress: vi.fn(),
   mockGetCategorizationStatusSnapshot: vi.fn(),
+  mockIsIntegrationActionEnabledForUserId: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("@/utils/llms", () => ({
@@ -76,6 +78,10 @@ vi.mock("@/utils/email/provider", () => ({
 
 vi.mock("@/utils/posthog", () => ({
   posthogCaptureEvent: mockPosthogCaptureEvent,
+}));
+
+vi.mock("@/utils/integration-action.server", () => ({
+  isIntegrationActionEnabledForUserId: mockIsIntegrationActionEnabledForUserId,
 }));
 
 vi.mock("@/utils/senders/unsubscribe", () => ({
@@ -212,6 +218,52 @@ describe("aiProcessAssistantChat", () => {
     expect(args.tools.sendEmail).toBeDefined();
     expect(args.tools.forwardEmail).toBeDefined();
   }, 30_000);
+
+  it.each([
+    ["web", 240_000],
+    ["messaging", 60_000],
+  ] as const)(
+    "continues %s tool calls without a step cap and reserves time for a final response",
+    async (responseSurface, toolBudgetMs) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+
+      try {
+        const { aiProcessAssistantChat } = await loadAssistantChatModule({
+          emailSend: true,
+        });
+
+        mockToolCallAgentStream.mockResolvedValue({
+          toUIMessageStreamResponse: vi.fn(),
+        });
+
+        await aiProcessAssistantChat({
+          messages: baseMessages,
+          emailAccountId: "email-account-id",
+          user: getEmailAccount(),
+          responseSurface,
+          logger,
+        });
+
+        const args = mockToolCallAgentStream.mock.lastCall?.[0];
+
+        expect(args.maxSteps).toBeUndefined();
+        expect(args.stopWhen()).toBe(false);
+
+        vi.advanceTimersByTime(toolBudgetMs - 1);
+        expect(await args.prepareStep()).toBeUndefined();
+
+        vi.advanceTimersByTime(1);
+        expect(await args.prepareStep()).toEqual({
+          activeTools: [],
+          toolChoice: "none",
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+    30_000,
+  );
 
   it.each([
     ["slack"],
@@ -1671,6 +1723,12 @@ describe("aiProcessAssistantChat", () => {
     expect(result).toEqual({
       messageId: "message-1",
       threadId: "thread-1",
+      evidence: {
+        state: "RECORDED_EXECUTIONS",
+        rootCauseKnown: null,
+        summary:
+          "Recorded rule executions are available. Use each execution's rule, status, reason, match metadata, and actions to explain only what those records establish.",
+      },
       executions: [
         {
           executedRuleId: "executed-rule-1",
@@ -1718,6 +1776,104 @@ describe("aiProcessAssistantChat", () => {
           actions: [],
         },
       ],
+    });
+  });
+
+  it("marks an empty rule execution history as missing evidence", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-without-history",
+    });
+
+    expect(result).toEqual({
+      messageId: "message-without-history",
+      threadId: null,
+      evidence: {
+        state: "NO_EXECUTION_RECORDS",
+        rootCauseKnown: false,
+        summary:
+          "No execution records were found. This is missing evidence, not proof that processing never ran or of why a rule did not match.",
+      },
+      executions: [],
+    });
+  });
+
+  it("marks ambiguous skipped execution history as inconclusive", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([
+      {
+        id: "executed-rule-fallback",
+        ruleId: null,
+        threadId: "thread-fallback",
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        status: "SKIPPED",
+        reason: "No rules matched.",
+        matchMetadata: null,
+        automated: true,
+        actionItems: [],
+        rule: null,
+      },
+    ]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-fallback",
+    });
+
+    expect(result).toMatchObject({
+      messageId: "message-fallback",
+      threadId: "thread-fallback",
+      evidence: {
+        state: "INCONCLUSIVE_SKIPPED_RECORDS",
+        rootCauseKnown: false,
+        summary:
+          "Only inconclusive skipped execution records were found. They do not establish whether a specific rule matched, was later deleted, or why processing was skipped.",
+      },
+    });
+  });
+
+  it("keeps applied execution evidence when the original rule is unavailable", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([
+      {
+        id: "executed-rule-deleted",
+        ruleId: null,
+        threadId: "thread-deleted-rule",
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        status: "APPLIED",
+        reason: "The rule applied before its configuration was removed.",
+        matchMetadata: [{ type: "STATIC" }],
+        automated: true,
+        actionItems: [
+          {
+            type: "LABEL",
+            label: "Handled",
+            labelId: "label-handled",
+            subject: null,
+            to: null,
+            cc: null,
+            bcc: null,
+            url: null,
+            folderName: null,
+          },
+        ],
+        rule: null,
+      },
+    ]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-deleted-rule",
+    });
+
+    expect(result).toMatchObject({
+      evidence: {
+        state: "RECORDED_EXECUTIONS",
+        rootCauseKnown: null,
+      },
     });
   });
 
@@ -2341,7 +2497,7 @@ describe("aiProcessAssistantChat", () => {
     });
     expect(mockUnsubscribeSenderAndMark).toHaveBeenCalledWith(
       expect.objectContaining({
-        newsletterEmail: "sender@example.com",
+        senderEmail: "sender@example.com",
         listUnsubscribeHeader: "<https://example.com/unsubscribe?id=1>",
       }),
     );

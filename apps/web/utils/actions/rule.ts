@@ -35,6 +35,7 @@ import {
   updateRuleInstructions,
   type RuleActionCreateData,
   addActionOwnershipToInput,
+  assertIntegrationActionsConnected,
 } from "@/utils/rule/rule";
 import { SafeError } from "@/utils/error";
 import {
@@ -129,7 +130,12 @@ export const updateRuleAction = actionClient
     }) => {
       await assertRuleIsNotOrgManaged({ ruleId: id, emailAccountId });
 
-      await assertCanUseDigestsIfNeeded(userId, actions);
+      const existingRule = await prisma.rule.findFirst({
+        where: { id, emailAccountId },
+        select: { actions: { select: { type: true } } },
+      });
+
+      await assertCanUseDigestsIfNeeded(userId, actions, existingRule?.actions);
 
       const conditions = flattenConditions(conditionsInput, logger);
 
@@ -817,7 +823,18 @@ function mapActionToSanitizedFields(action: {
   folderId?: { value?: string | null } | null;
   delayInMinutes?: number | null;
   staticAttachments?: AttachmentSourceInput[] | null;
+  integrationName?: string | null;
+  integrationToolName?: string | null;
+  integrationArgs?: Record<string, string | null | undefined> | null;
 }) {
+  const nonEmptyIntegrationArgs = action.integrationArgs
+    ? (Object.fromEntries(
+        Object.entries(action.integrationArgs).filter(
+          ([, value]) => typeof value === "string" && value.trim() !== "",
+        ),
+      ) as Record<string, string>)
+    : undefined;
+
   const sanitized = sanitizeActionFields({
     type: action.type,
     messagingChannelId: action.messagingChannelId ?? null,
@@ -835,6 +852,9 @@ function mapActionToSanitizedFields(action: {
     staticAttachments: action.staticAttachments?.length
       ? action.staticAttachments
       : undefined,
+    integrationName: action.integrationName,
+    integrationToolName: action.integrationToolName,
+    integrationArgs: nonEmptyIntegrationArgs,
   });
 
   return {
@@ -854,6 +874,9 @@ function mapActionToSanitizedFields(action: {
     folderId: sanitized.folderId ?? null,
     delayInMinutes: sanitized.delayInMinutes ?? null,
     staticAttachments: sanitized.staticAttachments ?? null,
+    integrationName: sanitized.integrationName ?? null,
+    integrationToolName: sanitized.integrationToolName ?? null,
+    integrationArgs: sanitized.integrationArgs ?? null,
   };
 }
 
@@ -1102,7 +1125,15 @@ export const importRulesAction = actionClient
             folderId: null,
             url: action.url,
             delayInMinutes: action.delayInMinutes,
+            integrationName: action.integrationName,
+            integrationToolName: action.integrationToolName,
+            integrationArgs: action.integrationArgs ?? undefined,
           }));
+
+          await assertIntegrationActionsConnected(
+            mappedActions,
+            emailAccountId,
+          );
 
           if (existingRuleId) {
             await replaceRuleWithResolvedActions({

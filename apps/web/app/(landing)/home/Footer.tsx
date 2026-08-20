@@ -13,6 +13,7 @@ export const footerNavigation = {
     },
     { name: "AI Email Assistant", href: "/ai-automation" },
     { name: "Mobile App", href: "/mobile-app" },
+    { name: "Desktop App", href: "/desktop" },
     { name: "AI Chat for Slack & Telegram", href: "/ai-assistant-chat" },
     { name: "Slack AI Assistant", href: "/slack-integration" },
     { name: "Telegram AI Assistant", href: "/telegram-integration" },
@@ -46,6 +47,11 @@ export const footerNavigation = {
       name: "Best AI Email Assistants",
       href: "/blog/post/best-ai-email-assistants",
     },
+    {
+      name: "AI Email Assistant Directory",
+      href: "https://aiemailassistants.com",
+      target: "_blank",
+    },
     { name: "vs Fyxer.ai", href: "/best-fyxer-alternative" },
     { name: "vs Superhuman", href: "/best-superhuman-alternative" },
     { name: "vs Shortwave", href: "/best-shortwave-alternative" },
@@ -55,6 +61,7 @@ export const footerNavigation = {
     },
   ],
   tools: [
+    { name: "All Free Email Tools", href: "/tools" },
     {
       name: "Email Deliverability Checker",
       href: "/tools/email-deliverability-checker",
@@ -66,6 +73,10 @@ export const footerNavigation = {
       href: "/tools/email-signature-generator",
     },
     { name: "Meeting Cost Calculator", href: "/tools/meeting-cost-calculator" },
+    {
+      name: "Team Email Cost Calculator",
+      href: "/tools/email-cost-calculator",
+    },
   ],
   support: [
     { name: "Pricing", href: "/pricing" },

@@ -6,13 +6,16 @@ import {
 import { isDefined } from "@/utils/types";
 import { getRuleLabel } from "@/utils/rule/consts";
 import { SystemType } from "@/generated/prisma/enums";
-import { GmailLabel } from "@/utils/gmail/label";
+import { GMAIL_SYSTEM_LABELS, GmailLabel } from "@/utils/gmail/label";
 import { OutlookLabel } from "@/utils/outlook/constants";
 
-export type EmailMessageCellLabel = Pick<EmailLabel, "id" | "name">;
+export type EmailMessageCellLabel = Pick<EmailLabel, "id" | "name" | "color">;
 
 const TO_REPLY_LABEL = getRuleLabel(SystemType.TO_REPLY);
 const AWAITING_REPLY_LABEL = getRuleLabel(SystemType.AWAITING_REPLY);
+const GMAIL_CATEGORY_LABELS = new Set(
+  GMAIL_SYSTEM_LABELS.filter((label) => label.startsWith("CATEGORY_")),
+);
 
 export function getEmailMessageCellLabels({
   labelIds,
@@ -34,7 +37,7 @@ export function getEmailMessageCellLabels({
         );
 
       if (!label) return null;
-      return { id: label.id, name: label.name };
+      return { id: label.id, name: label.name, color: label.color };
     })
     .filter(isDefined)
     .filter((label) => {
@@ -52,10 +55,30 @@ export function getEmailMessageCellLabels({
     });
 
   if (shouldShowArchivedLabel({ labelIds, provider, labels })) {
-    labels?.unshift({ id: OutlookLabel.ARCHIVE, name: "Archived" });
+    labels?.unshift({
+      id: OutlookLabel.ARCHIVE,
+      name: "Archived",
+      color: undefined,
+    });
   }
 
   return labels;
+}
+
+export function getEmailThreadLabels({
+  messages,
+  userLabels,
+}: {
+  messages: { labelIds?: string[] }[];
+  userLabels: EmailLabels;
+}): EmailMessageCellLabel[] {
+  const labelIds = [
+    ...new Set(
+      [...messages].reverse().flatMap((message) => message.labelIds ?? []),
+    ),
+  ].filter((labelId) => !GMAIL_CATEGORY_LABELS.has(labelId));
+
+  return getEmailMessageCellLabels({ labelIds, userLabels }) ?? [];
 }
 
 function shouldShowArchivedLabel({

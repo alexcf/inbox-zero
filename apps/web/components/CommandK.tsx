@@ -1,8 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { ArchiveIcon, Loader2Icon } from "lucide-react";
-import { useAtomValue } from "jotai";
+import { ArrowLeftIcon, Loader2Icon } from "lucide-react";
+import { useAtom, useAtomValue } from "jotai";
+import { buildMailCommandPalette } from "@/app/(app)/[emailAccountId]/mail/mail-command-palette";
+import { buildSnoozeCommandPalette } from "@/app/(app)/[emailAccountId]/mail/snooze-command-palette";
 import {
   CommandDialog,
   CommandEmpty,
@@ -14,13 +16,24 @@ import {
   CommandShortcut,
 } from "@/components/ui/command";
 import { useComposeModal } from "@/providers/ComposeModalProvider";
-import { refetchEmailListAtom } from "@/store/email";
+import {
+  commandPaletteOpenAtom,
+  mailCommandContextAtom,
+} from "@/store/command-palette";
+import type { MailCommandContext } from "@/store/command-palette";
 import { archiveEmails } from "@/store/archive-queue";
 import { useDisplayedEmail } from "@/hooks/useDisplayedEmail";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { useCommandPaletteCommands } from "@/hooks/useCommandPaletteCommands";
 import { fuzzySearch } from "@/lib/commands/fuzzy-search";
 import type { Command, CommandSection } from "@/lib/commands/types";
+import { ShortcutsProvider } from "@/lib/shortcuts/ShortcutsProvider";
+import { useShortcuts } from "@/lib/shortcuts/useShortcuts";
+import {
+  buildShortcutPaletteCommands,
+  MAIL_SHORTCUT_SCOPES,
+  type ShortcutHandlers,
+} from "@/lib/shortcuts/registry";
 
 const SECTION_ORDER: CommandSection[] = [
   "actions",
@@ -38,162 +51,170 @@ const SECTION_LABELS: Record<CommandSection, string> = {
   settings: "Settings",
 };
 
+// Mounted app-wide. It enables the mail scope everywhere so the side-panel email
+// viewer keeps its triage keys on any page. That doesn't collide with the mail
+// route's own bindings: these handlers are only defined when the side panel has a
+// thread (`side-panel-thread-id`), which the mail list never sets — and the mail
+// screen in turn stands down while the side panel is open.
 export function CommandK() {
-  const [open, setOpen] = React.useState(false);
+  return (
+    <ShortcutsProvider scopes={MAIL_SHORTCUT_SCOPES}>
+      <CommandPalette />
+    </ShortcutsProvider>
+  );
+}
+
+function CommandPalette() {
+  const mailCommandContext = useAtomValue(mailCommandContextAtom);
+  const displayedEmail = useDisplayedEmail();
+  const activeMailContext = displayedEmail.threadId ? null : mailCommandContext;
+
+  return (
+    <CommandPaletteContent
+      key={activeMailContext ? "mail" : "default"}
+      displayedEmail={displayedEmail}
+      mailCommandContext={activeMailContext}
+    />
+  );
+}
+
+function CommandPaletteContent({
+  displayedEmail,
+  mailCommandContext,
+}: {
+  displayedEmail: ReturnType<typeof useDisplayedEmail>;
+  mailCommandContext: MailCommandContext | null;
+}) {
+  const [open, setOpen] = useAtom(commandPaletteOpenAtom);
+  const [page, setPage] = React.useState<"root" | "snooze">("root");
   const [search, setSearch] = React.useState("");
 
   const { emailAccountId } = useAccount();
-  const { threadId, showEmail } = useDisplayedEmail();
-  const refreshEmailList = useAtomValue(refetchEmailListAtom);
+  const { threadId, showEmail } = displayedEmail;
   const { onOpen: onOpenComposeModal } = useComposeModal();
-  const { commands, isLoading } = useCommandPaletteCommands();
+  const { commands, isLoading } = useCommandPaletteCommands({
+    enabled: !mailCommandContext,
+  });
 
-  const onArchive = React.useCallback(() => {
-    if (threadId) {
-      const threadIds = [threadId];
-      archiveEmails({
-        threadIds,
-        onSuccess: () =>
-          refreshEmailList?.refetch({ removedThreadIds: threadIds }),
-        emailAccountId,
-      });
-      showEmail(null);
-    }
-  }, [refreshEmailList, threadId, showEmail, emailAccountId]);
-
-  // build action commands that include archive and compose
-  const actionCommands = React.useMemo<Command[]>(() => {
-    const actions: Command[] = [];
-
-    if (threadId) {
-      actions.unshift({
-        id: "archive",
-        label: "Archive",
-        description: "Archive current email",
-        icon: ArchiveIcon,
-        shortcut: "E",
-        section: "actions",
-        priority: 0,
-        keywords: ["archive", "remove", "delete"],
-        action: () => onArchive(),
-      });
-    }
-
-    return actions;
-  }, [threadId, onArchive]);
-
-  // combine action commands with dynamic commands
-  const allCommands = React.useMemo(
-    () => [...actionCommands, ...commands],
-    [actionCommands, commands],
-  );
-
-  // filter commands with fuzzy search
-  const filteredCommands = React.useMemo(() => {
-    if (!search.trim()) {
-      return allCommands;
-    }
-    return fuzzySearch(search, allCommands);
-  }, [allCommands, search]);
-
-  // group commands by section
-  const groupedCommands = React.useMemo(() => {
-    const groups: Record<CommandSection, Command[]> = {
-      actions: [],
-      navigation: [],
-      rules: [],
-      accounts: [],
-      settings: [],
-    };
-
-    for (const command of filteredCommands) {
-      groups[command.section].push(command);
-    }
-
-    return groups;
-  }, [filteredCommands]);
-
-  // execute command
-  const executeCommand = React.useCallback((command: Command) => {
-    setOpen(false);
-    setSearch("");
-    command.action();
-  }, []);
-
-  // memoized handlers to avoid re-renders
-  const handleOpenChange = React.useCallback((isOpen: boolean) => {
-    setOpen(isOpen);
-    if (!isOpen) setSearch("");
-  }, []);
-
-  const commandProps = React.useMemo(
-    () => ({
-      // disable cmdk's built-in filter since we use custom fuzzy search
-      shouldFilter: false,
-      onKeyDown: (e: React.KeyboardEvent) => {
-        if (e.key !== "Escape") {
-          e.stopPropagation();
-        }
-      },
-    }),
-    [],
-  );
-
-  // keyboard shortcuts
-  React.useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      // cmd+k to toggle palette
-      if ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        setOpen((prev) => !prev);
-        return;
-      }
-
-      // don't handle other shortcuts when palette is open
-      if (open) return;
-
-      // escape to close email preview
-      if (e.key === "Escape") {
-        if (threadId) {
-          e.preventDefault();
+  const shortcutHandlers: ShortcutHandlers = {
+    commandPalette: () => setOpen((wasOpen) => !wasOpen),
+    compose: onOpenComposeModal,
+    archive: threadId
+      ? () => {
+          archiveEmails({ threadIds: [threadId], emailAccountId });
           showEmail(null);
         }
-        return;
-      }
+      : undefined,
+    snooze: mailCommandContext?.actions.snooze
+      ? () => {
+          setSearch("");
+          setPage("snooze");
+          setOpen(true);
+        }
+      : undefined,
+    // While the palette is open, Escape belongs to the dialog.
+    backToList: open || !threadId ? undefined : () => showEmail(null),
+  };
 
-      // only handle shortcuts when focus is on body
-      if (document?.activeElement?.tagName !== "BODY") return;
+  useShortcuts(shortcutHandlers);
 
-      // e for archive
-      if ((e.key === "e" || e.key === "E") && !(e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        onArchive();
-        return;
-      }
+  const shortcutCommands = buildShortcutPaletteCommands(shortcutHandlers);
+  const mailCommands = mailCommandContext
+    ? buildMailCommandPalette({
+        actions: {
+          archive: mailCommandContext.actions.archive,
+          markRead: mailCommandContext.actions.markRead,
+          markUnread: mailCommandContext.actions.markUnread,
+          openSnooze: mailCommandContext.actions.snooze
+            ? () => setPage("snooze")
+            : undefined,
+          trash: mailCommandContext.actions.trash,
+        },
+        hasRead: mailCommandContext.hasRead,
+        hasUnread: mailCommandContext.hasUnread,
+        targetCount: mailCommandContext.targetCount,
+      })
+    : [];
 
-      // c for compose
-      if ((e.key === "c" || e.key === "C") && !(e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        onOpenComposeModal();
-        return;
-      }
-    };
+  let allCommands: Command[];
+  if (page === "snooze" && mailCommandContext?.actions.snooze) {
+    const snoozeCommands = buildSnoozeCommandPalette({
+      onSnooze: mailCommandContext.actions.snooze,
+      query: search,
+    });
+    allCommands = search.trim()
+      ? snoozeCommands
+      : [
+          {
+            id: "mail-snooze-back",
+            label: "Back to commands",
+            icon: ArrowLeftIcon,
+            section: "actions",
+            priority: -1,
+            closeOnSelect: false,
+            action: () => setPage("root"),
+          },
+          ...snoozeCommands,
+        ];
+  } else {
+    const actionCommands = mailCommandContext
+      ? [
+          ...mailCommands,
+          ...shortcutCommands.filter((command) => command.id === "compose"),
+        ]
+      : shortcutCommands;
+    allCommands = [...actionCommands, ...commands];
+  }
 
-    document.addEventListener("keydown", down);
+  const filteredCommands =
+    page === "snooze" || !search.trim()
+      ? allCommands
+      : fuzzySearch(search, allCommands);
+  const groupedCommands = groupCommands(filteredCommands);
 
-    return () => {
-      document.removeEventListener("keydown", down);
-    };
-  }, [open, onArchive, onOpenComposeModal, threadId, showEmail]);
+  const executeCommand = (command: Command) => {
+    setSearch("");
+    if (command.closeOnSelect !== false) {
+      setOpen(false);
+      setPage("root");
+    }
+    command.action();
+  };
+
+  const handleOpenChange = (isOpen: boolean) => {
+    setOpen(isOpen);
+    if (!isOpen) {
+      setPage("root");
+      setSearch("");
+    }
+  };
 
   return (
     <CommandDialog
       open={open}
       onOpenChange={handleOpenChange}
-      commandProps={commandProps}
+      onEscapeKeyDown={(event) => {
+        if (page !== "snooze") return;
+        event.preventDefault();
+        setPage("root");
+        setSearch("");
+      }}
+      commandProps={{
+        // Disable cmdk's built-in filter since we use custom fuzzy search.
+        shouldFilter: false,
+        onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+          if (event.key !== "Escape") event.stopPropagation();
+        },
+      }}
     >
       <CommandInput
-        placeholder="Type a command or search..."
+        key={page}
+        autoFocus
+        placeholder={
+          page === "snooze"
+            ? "When should it return? Try Friday at 3pm"
+            : "Type a command or search..."
+        }
         value={search}
         onValueChange={setSearch}
       />
@@ -204,7 +225,11 @@ export function CommandK() {
           </div>
         ) : (
           <>
-            <CommandEmpty>No results found.</CommandEmpty>
+            <CommandEmpty>
+              {page === "snooze"
+                ? "Try a date like tomorrow at 3pm."
+                : "No results found."}
+            </CommandEmpty>
             {SECTION_ORDER.map((section, index) => {
               const sectionCommands = groupedCommands[section];
               if (sectionCommands.length === 0) return null;
@@ -218,7 +243,13 @@ export function CommandK() {
               return (
                 <React.Fragment key={section}>
                   {showSeparator && <CommandSeparator />}
-                  <CommandGroup heading={SECTION_LABELS[section]}>
+                  <CommandGroup
+                    heading={
+                      page === "snooze" && section === "actions"
+                        ? "Snooze until"
+                        : SECTION_LABELS[section]
+                    }
+                  >
                     {sectionCommands.map((command) => (
                       <CommandItem
                         key={command.id}
@@ -228,14 +259,7 @@ export function CommandK() {
                         {command.icon && (
                           <command.icon className="mr-2 h-4 w-4" />
                         )}
-                        <div className="flex flex-1 flex-col">
-                          <span>{command.label}</span>
-                          {command.description && (
-                            <span className="text-xs text-muted-foreground">
-                              {command.description}
-                            </span>
-                          )}
-                        </div>
+                        <span className="flex-1">{command.label}</span>
                         {command.shortcut && (
                           <CommandShortcut>{command.shortcut}</CommandShortcut>
                         )}
@@ -265,9 +289,23 @@ export function CommandK() {
           <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-[10px]">
             esc
           </kbd>
-          close
+          {page === "snooze" ? "back" : "close"}
         </span>
       </div>
     </CommandDialog>
   );
+}
+
+function groupCommands(commands: Command[]) {
+  const groups: Record<CommandSection, Command[]> = {
+    actions: [],
+    navigation: [],
+    rules: [],
+    accounts: [],
+    settings: [],
+  };
+
+  for (const command of commands) groups[command.section].push(command);
+
+  return groups;
 }

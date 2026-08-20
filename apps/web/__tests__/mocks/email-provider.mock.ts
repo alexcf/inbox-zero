@@ -80,6 +80,13 @@ export function createMockEmailProvider(
     getMessagesWithPagination: vi
       .fn()
       .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+    getMailboxSyncPage: vi.fn().mockResolvedValue({
+      cursor: "sync-cursor",
+      deletedMessageIds: [],
+      hasMore: false,
+      reset: false,
+      upsertedMessages: [],
+    }),
     searchMessages: vi
       .fn()
       .mockResolvedValue({ messages: [], nextPageToken: undefined }),
@@ -95,6 +102,7 @@ export function createMockEmailProvider(
     getLabelById: vi.fn().mockResolvedValue(null),
     getLabelByName: vi.fn().mockResolvedValue(null),
     getFolders: vi.fn().mockResolvedValue([]),
+    getFolderCounts: vi.fn().mockResolvedValue([]),
     createLabel: vi
       .fn()
       .mockResolvedValue({ id: "label-123", name: "Test Label", type: "user" }),
@@ -106,8 +114,13 @@ export function createMockEmailProvider(
     // Thread/message actions
     archiveThread: vi.fn().mockResolvedValue(undefined),
     archiveThreadWithLabel: vi.fn().mockResolvedValue(undefined),
+    bulkArchiveThreads: vi.fn().mockResolvedValue({
+      succeededThreadIds: [],
+      failedThreadIds: [],
+    }),
     archiveMessage: vi.fn().mockResolvedValue(undefined),
     trashThread: vi.fn().mockResolvedValue(undefined),
+    unarchiveThread: vi.fn().mockResolvedValue(undefined),
     markSpam: vi.fn().mockResolvedValue(undefined),
     starMessage: vi.fn().mockResolvedValue(undefined),
     markRead: vi.fn().mockResolvedValue(undefined),

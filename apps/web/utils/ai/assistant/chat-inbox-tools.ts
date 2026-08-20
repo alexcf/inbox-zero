@@ -4,6 +4,7 @@ import type { Logger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
 import { posthogCaptureEvent } from "@/utils/posthog";
 import { createEmailProvider } from "@/utils/email/provider";
+import { isGoogleProvider } from "@/utils/email/provider-types";
 import {
   extractEmailAddress,
   extractUniqueEmailAddresses,
@@ -16,6 +17,8 @@ import type { ParsedMessage } from "@/utils/types";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import { getFormattedSenderAddress } from "@/utils/email/get-formatted-sender-address";
 import { runWithBoundedConcurrency } from "@/utils/async";
+import { findNestedLabelMatches } from "@/utils/label/find-nested-label-matches";
+import { normalizeLabelName } from "@/utils/label/normalize-label-name";
 import { resolveLabelNameAndId } from "@/utils/label/resolve-label";
 import {
   buildOutlookSearchFallbackQuery,
@@ -34,7 +37,6 @@ import {
   type ManageInboxAction,
   manageInboxActions,
   requiresSenderEmails,
-  requiresThreadIds,
 } from "@/utils/ai/assistant/manage-inbox-actions";
 import { hideToolErrorFromUser } from "@/utils/ai/assistant/tool-error-visibility";
 import {
@@ -45,12 +47,14 @@ import {
   getCategorizationProgress,
   getCategorizationStatusSnapshot,
 } from "@/utils/redis/categorization-progress";
-import { extractErrorInfo, isRetryableError } from "@/utils/outlook/retry";
+import { extractErrorInfo, isRetryableError } from "@/utils/microsoft/retry";
 import {
   extractErrorInfo as extractGmailErrorInfo,
   isRetryableError as isGmailRetryableError,
 } from "@/utils/gmail/retry";
 import { microsoftGraphPageTokenSchema } from "@/utils/outlook/page-token";
+import { validateUserAndAiAccess } from "@/utils/user/validate";
+import { SafeError } from "@/utils/error";
 
 const SEARCH_INBOX_MAX_RESULTS = 20;
 const OUTLOOK_EMPTY_PAGE_AUTOPAGINATION_LIMIT = 5;
@@ -373,6 +377,8 @@ export const startSenderCategorizationTool = ({
       trackToolCall({ tool: "start_sender_categorization", email, logger });
 
       try {
+        await validateUserAndAiAccess({ emailAccountId });
+
         const emailProvider = await createEmailProvider({
           emailAccountId,
           provider,
@@ -385,6 +391,11 @@ export const startSenderCategorizationTool = ({
           logger,
         });
       } catch (error) {
+        if (error instanceof SafeError) {
+          logger.warn("Unable to start sender categorization", { error });
+          return { error: error.message };
+        }
+
         logger.error("Failed to start sender categorization", { error });
         return {
           error: "Failed to start sender categorization",
@@ -871,7 +882,7 @@ const senderEmailsSchema = z
   .max(100)
   .transform((emails) => [...new Set(emails)]);
 
-const microsoftManageInboxActions = [
+const outlookManageInboxActions = [
   "archive_threads",
   "trash_threads",
   "categorize_threads",
@@ -881,81 +892,87 @@ const microsoftManageInboxActions = [
   "unsubscribe_senders",
 ] as const;
 
-const outlookManageInboxInputSchema = z.object({
-  action: z
-    .enum(microsoftManageInboxActions)
-    .describe(
-      "archive_threads: archive by ID (default unless user says delete/trash). trash_threads: move to trash. categorize_threads: apply a category (requires categoryName). remove_category_threads: remove an existing category (requires categoryName). mark_read_threads: mark read/unread. bulk_archive_senders: archive ALL emails from senders server-wide after the user confirms that broad scope (never for trash/delete). unsubscribe_senders: unsubscribe and archive from senders (only for explicit unsubscribe requests).",
-    ),
-  threadIds: threadIdsSchema
-    .nullish()
-    .describe(
-      "Required for archive_threads, trash_threads, categorize_threads, remove_category_threads, and mark_read_threads. Use IDs from searchInbox results or thread IDs the user already provided.",
-    ),
-  category: z
-    .string()
-    .nullish()
-    .describe(
-      "Optional exact Outlook category name to apply while archiving threads.",
-    ),
-  categoryName: z
-    .string()
-    .trim()
-    .min(1)
-    .nullish()
-    .describe(
-      "Exact Outlook category name to apply to or remove from the selected threads.",
-    ),
-  read: z
-    .boolean()
-    .nullish()
-    .describe("For mark_read_threads: true for read, false for unread."),
-  fromEmails: senderEmailsSchema
-    .nullish()
-    .describe(
-      "Required for bulk_archive_senders and unsubscribe_senders. Sender email addresses to act on.",
-    ),
-});
+const outlookManageInboxInputSchema = z
+  .strictObject({
+    action: z
+      .enum(outlookManageInboxActions)
+      .describe(
+        "Outlook inbox action. archive_threads archives selected threads; trash_threads moves selected threads to trash; categorize_threads applies an existing category; remove_category_threads removes one; mark_read_threads sets read state; bulk_archive_senders archives all mail from senders; unsubscribe_senders unsubscribes and archives.",
+      ),
+    threadIds: threadIdsSchema
+      .optional()
+      .describe(
+        "Required for thread actions. Use IDs from searchInbox results or IDs the user already provided; omit for sender-wide actions.",
+      ),
+    categoryName: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe(
+        "Exact Outlook category name. Required for categorize_threads and remove_category_threads; optional for archive_threads; omit for other actions.",
+      ),
+    read: z
+      .boolean()
+      .optional()
+      .describe(
+        "Required for mark_read_threads: true marks read and false marks unread. Omit for other actions.",
+      ),
+    fromEmails: senderEmailsSchema
+      .optional()
+      .describe(
+        "Required for bulk_archive_senders and unsubscribe_senders. These actions affect all mail from each sender; omit for thread actions.",
+      ),
+  })
+  .superRefine((input, context) =>
+    validateManageInboxInput(input, context, {
+      taxonomyField: "categoryName",
+      taxonomyActions: ["categorize_threads", "remove_category_threads"],
+    }),
+  )
+  .describe("Outlook inbox action input.");
 
-const gmailManageInboxInputSchema = z.object({
-  action: z
-    .enum(manageInboxActions)
-    .describe(
-      "archive_threads: archive by ID (default unless user says delete/trash). trash_threads: move to trash. label_threads: apply a label (requires labelName). remove_label_threads: remove an existing label (requires labelName). mark_read_threads: mark read/unread. bulk_archive_senders: archive ALL emails from senders server-wide after the user confirms that broad scope (never for trash/delete). unsubscribe_senders: unsubscribe and archive from senders (only for explicit unsubscribe requests).",
-    ),
-  threadIds: threadIdsSchema
-    .nullish()
-    .describe(
-      "Required for archive_threads, trash_threads, label_threads, remove_label_threads, and mark_read_threads. Use IDs from searchInbox results or thread IDs the user already provided.",
-    ),
-  label: z
-    .string()
-    .nullish()
-    .describe(
-      "Optional exact Gmail label name to apply while archiving threads.",
-    ),
-  labelName: z
-    .string()
-    .trim()
-    .min(1)
-    .nullish()
-    .describe(
-      "Exact Gmail label name to apply to or remove from the selected threads.",
-    ),
-  read: z
-    .boolean()
-    .nullish()
-    .describe("For mark_read_threads: true for read, false for unread."),
-  fromEmails: senderEmailsSchema
-    .nullish()
-    .describe(
-      "Required for bulk_archive_senders and unsubscribe_senders. Sender email addresses to act on.",
-    ),
-});
+const gmailManageInboxInputSchema = z
+  .strictObject({
+    action: z
+      .enum(manageInboxActions)
+      .describe(
+        "Gmail inbox action. archive_threads archives selected threads; trash_threads moves selected threads to trash; label_threads applies an existing label; remove_label_threads removes one; mark_read_threads sets read state; bulk_archive_senders archives all mail from senders; unsubscribe_senders unsubscribes and archives.",
+      ),
+    threadIds: threadIdsSchema
+      .optional()
+      .describe(
+        "Required for thread actions. Use IDs from searchInbox results or IDs the user already provided; omit for sender-wide actions.",
+      ),
+    labelName: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe(
+        "Exact Gmail label name. Required for label_threads and remove_label_threads; optional for archive_threads; omit for other actions.",
+      ),
+    read: z
+      .boolean()
+      .optional()
+      .describe(
+        "Required for mark_read_threads: true marks read and false marks unread. Omit for other actions.",
+      ),
+    fromEmails: senderEmailsSchema
+      .optional()
+      .describe(
+        "Required for bulk_archive_senders and unsubscribe_senders. These actions affect all mail from each sender; omit for thread actions.",
+      ),
+  })
+  .superRefine((input, context) =>
+    validateManageInboxInput(input, context, {
+      taxonomyField: "labelName",
+      taxonomyActions: ["label_threads", "remove_label_threads"],
+    }),
+  )
+  .describe("Gmail inbox action input.");
 
 type ManageInboxTaxonomyConfig = {
-  threadIdsRequiredError: string;
-  labelNameRequiredError: string;
   labelResolutionFallbackError: string;
   missingLabelError: (name: string, action: ManageInboxAction) => string;
   resultKeys: {
@@ -970,10 +987,6 @@ const outlookManageInboxTool = (options: InboxToolOptions) =>
     inputSchema: outlookManageInboxInputSchema,
     normalizeInput: normalizeOutlookManageInboxInput,
     taxonomy: {
-      threadIdsRequiredError:
-        "threadIds is required when action is archive_threads, categorize_threads, remove_category_threads, or mark_read_threads",
-      labelNameRequiredError:
-        "categoryName is required when action is categorize_threads or remove_category_threads",
       labelResolutionFallbackError: "Failed to resolve category",
       missingLabelError: (name, action) =>
         action === "remove_label_threads"
@@ -992,10 +1005,6 @@ const gmailManageInboxTool = (options: InboxToolOptions) =>
     inputSchema: gmailManageInboxInputSchema,
     normalizeInput: normalizeGmailManageInboxInput,
     taxonomy: {
-      threadIdsRequiredError:
-        "threadIds is required when action is archive_threads, label_threads, remove_label_threads, or mark_read_threads",
-      labelNameRequiredError:
-        "labelName is required when action is label_threads or remove_label_threads",
       labelResolutionFallbackError: "Failed to resolve label",
       missingLabelError: (name, action) =>
         action === "remove_label_threads"
@@ -1033,7 +1042,7 @@ const buildManageInboxTool = ({
 
   return tool({
     description:
-      "Run inbox actions on threads or senders. For emails already shown or found in this turn, prefer thread actions with threadIds. Do not widen a limited thread-level request into sender-wide cleanup. Only use sender-wide cleanup with fromEmails when the user clearly wants all mail from that sender, and get confirmation before doing broad sender-wide cleanup.",
+      "Run inbox actions on threads or senders. For emails already shown or found in this turn, prefer thread actions with threadIds. Use archive_threads for ordinary inbox cleanup; only use trash_threads when the user explicitly asks to delete or trash. Do not widen a limited thread-level request into sender-wide cleanup. Only use sender-wide cleanup with fromEmails when the user clearly wants all mail from that sender, and get confirmation before doing broad sender-wide cleanup. Only use unsubscribe_senders for an explicit unsubscribe request.",
     inputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "manage_inbox", email, logger });
@@ -1052,27 +1061,8 @@ const buildManageInboxTool = ({
       const parsedInput = normalizeInput(
         parsedInputResult.data as Record<string, unknown>,
       );
-      const { action, labelName, label, originalAction } = parsedInput;
+      const { action, labelName, originalAction } = parsedInput;
       const isSenderAction = requiresSenderEmails(action);
-
-      if (isSenderAction && !parsedInput.fromEmails?.length) {
-        return {
-          error:
-            'No sender-level action was taken. "fromEmails" is required for bulk_archive_senders and unsubscribe_senders. If you only meant the emails already shown, use archive_threads with threadIds instead.',
-        };
-      }
-
-      if (requiresThreadIds(action) && !parsedInput.threadIds?.length) {
-        return {
-          error: taxonomy.threadIdsRequiredError,
-        };
-      }
-
-      if (isThreadLabelAction(action) && !labelName) {
-        return {
-          error: taxonomy.labelNameRequiredError,
-        };
-      }
 
       try {
         const emailProvider = await createEmailProvider({
@@ -1150,7 +1140,7 @@ const buildManageInboxTool = ({
 
         const resolvedArchiveLabel =
           action === "archive_threads"
-            ? await resolveLabelNameAndId({ emailProvider, label })
+            ? await resolveLabelNameAndId({ emailProvider, label: labelName })
             : null;
         const resolvedArchiveLabelId =
           resolvedArchiveLabel?.labelId ?? undefined;
@@ -1164,6 +1154,7 @@ const buildManageInboxTool = ({
               emailProvider,
               labelName: labelName!,
               action,
+              matchNestedLabels: isGoogleProvider(provider),
               missingLabelError: taxonomy.missingLabelError,
             });
           } catch (error) {
@@ -1981,23 +1972,51 @@ async function resolveThreadLabel({
   emailProvider,
   labelName,
   action,
+  matchNestedLabels,
   missingLabelError,
 }: {
   emailProvider: EmailProvider;
   labelName: string;
   action: ManageInboxAction;
+  matchNestedLabels: boolean;
   missingLabelError: (name: string, action: ManageInboxAction) => string;
 }) {
   const existingLabel = await emailProvider.getLabelByName(labelName);
 
-  if (!existingLabel) {
-    throw new Error(missingLabelError(labelName, action));
+  if (existingLabel) {
+    return {
+      labelId: existingLabel.id,
+      labelName: existingLabel.name,
+    };
   }
 
-  return {
-    labelId: existingLabel.id,
-    labelName: existingLabel.name,
-  };
+  if (matchNestedLabels) {
+    const labels = await emailProvider.getLabels({ includeHidden: true });
+    const nestedMatches = findNestedLabelMatches({
+      labels,
+      name: labelName,
+      getLabelName: (label) => label.name,
+      normalize: normalizeLabelName,
+    });
+
+    if (nestedMatches.length === 1) {
+      return {
+        labelId: nestedMatches[0].id,
+        labelName: nestedMatches[0].name,
+      };
+    }
+
+    if (nestedMatches.length > 1) {
+      const paths = nestedMatches
+        .map((label) => JSON.stringify(label.name))
+        .join(", ");
+      throw new Error(
+        `Multiple Gmail labels match "${labelName}": ${paths}. Use the full label path.`,
+      );
+    }
+  }
+
+  throw new Error(missingLabelError(labelName, action));
 }
 
 async function runSenderUnsubscribeActions({
@@ -2025,7 +2044,7 @@ async function runSenderUnsubscribeActions({
 
       return unsubscribeSenderAndMark({
         emailAccountId,
-        newsletterEmail: senderEmail,
+        senderEmail: senderEmail,
         listUnsubscribeHeader,
         unsubscribeLink,
         logger,
@@ -2338,16 +2357,51 @@ function extractEmailAddressesFromMicrosoftSearchQuery(query: string) {
   ];
 }
 
+function validateManageInboxInput(
+  input: { action: string } & Partial<
+    Record<
+      "threadIds" | "labelName" | "categoryName" | "read" | "fromEmails",
+      string | boolean | string[]
+    >
+  >,
+  context: z.RefinementCtx,
+  options: {
+    taxonomyField: "labelName" | "categoryName";
+    taxonomyActions: readonly string[];
+  },
+) {
+  const { action } = input;
+  const isSenderAction =
+    action === "bulk_archive_senders" || action === "unsubscribe_senders";
+  const requiredFields = new Set<
+    "threadIds" | "labelName" | "categoryName" | "read" | "fromEmails"
+  >(isSenderAction ? ["fromEmails"] : ["threadIds"]);
+  if (options.taxonomyActions.includes(action)) {
+    requiredFields.add(options.taxonomyField);
+  }
+  if (action === "mark_read_threads") requiredFields.add("read");
+
+  for (const field of requiredFields) {
+    if (input[field] === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: [field],
+        message: `is required for ${action}`,
+      });
+    }
+  }
+}
+
 function getManageInboxValidationError(error: z.ZodError) {
   const firstIssue = error.issues[0];
   if (!firstIssue) return "Invalid manageInbox input";
 
-  if (firstIssue.code === "too_small" && firstIssue.path[0] === "threadIds") {
-    return "Invalid manageInbox input: threadIds must include at least one thread ID";
+  if (firstIssue.path[0] === "fromEmails") {
+    return 'No sender-level action was taken. "fromEmails" is required for bulk_archive_senders and unsubscribe_senders. If you only meant the emails already shown, use archive_threads with threadIds instead.';
   }
 
-  if (firstIssue.code === "too_small" && firstIssue.path[0] === "fromEmails") {
-    return "Invalid manageInbox input: fromEmails must include at least one sender email";
+  if (firstIssue.code === "too_small" && firstIssue.path[0] === "threadIds") {
+    return "Invalid manageInbox input: threadIds must include at least one thread ID";
   }
 
   const field = firstIssue.path.map(String).join(".");
@@ -2385,7 +2439,6 @@ type NormalizedManageInboxInput = {
   action: ManageInboxAction;
   originalAction: string;
   threadIds?: string[] | null;
-  label?: string | null;
   labelName?: string | null;
   read?: boolean | null;
   fromEmails?: string[] | null;
@@ -2399,7 +2452,6 @@ function normalizeGmailManageInboxInput(
     action: originalAction as ManageInboxAction,
     originalAction,
     threadIds: parsed.threadIds as string[] | null | undefined,
-    label: parsed.label as string | null | undefined,
     labelName: parsed.labelName as string | null | undefined,
     read: parsed.read as boolean | null | undefined,
     fromEmails: parsed.fromEmails as string[] | null | undefined,
@@ -2421,7 +2473,6 @@ function normalizeOutlookManageInboxInput(
     action,
     originalAction,
     threadIds: parsed.threadIds as string[] | null | undefined,
-    label: parsed.category as string | null | undefined,
     labelName: parsed.categoryName as string | null | undefined,
     read: parsed.read as boolean | null | undefined,
     fromEmails: parsed.fromEmails as string[] | null | undefined,

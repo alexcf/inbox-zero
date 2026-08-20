@@ -1,0 +1,270 @@
+name: Playwright
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/app/**"
+      - "apps/web/components/**"
+      - "apps/web/hooks/**"
+      - "apps/web/providers/**"
+      - "apps/web/store/**"
+      - "apps/web/styles/**"
+      - "apps/web/utils/auth/**"
+      - "apps/web/utils/auth.ts"
+      - "apps/web/utils/auth-client.ts"
+      - "apps/web/utils/middleware.ts"
+      - "apps/web/__tests__/playwright/**"
+      - "apps/web/emulate.playwright.config.yaml"
+      - "apps/web/playwright.config.mjs"
+      - "apps/web/scripts/generate-playwright-report-dashboard.ts"
+      - "apps/web/scripts/playwright-report-dashboard*"
+      - "apps/web/env.ts"
+      - "apps/web/instrumentation.ts"
+      - "apps/web/next.config.*"
+      - "apps/web/package.json"
+      - "pnpm-lock.yaml"
+      - "scripts/pnpm-install-without-desktop.sh"
+      - ".github/workflows/playwright.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/web/app/**"
+      - "apps/web/components/**"
+      - "apps/web/hooks/**"
+      - "apps/web/providers/**"
+      - "apps/web/store/**"
+      - "apps/web/styles/**"
+      - "apps/web/utils/auth/**"
+      - "apps/web/utils/auth.ts"
+      - "apps/web/utils/auth-client.ts"
+      - "apps/web/utils/middleware.ts"
+      - "apps/web/__tests__/playwright/**"
+      - "apps/web/emulate.playwright.config.yaml"
+      - "apps/web/playwright.config.mjs"
+      - "apps/web/scripts/generate-playwright-report-dashboard.ts"
+      - "apps/web/scripts/playwright-report-dashboard*"
+      - "apps/web/env.ts"
+      - "apps/web/instrumentation.ts"
+      - "apps/web/next.config.*"
+      - "apps/web/package.json"
+      - "pnpm-lock.yaml"
+      - "scripts/pnpm-install-without-desktop.sh"
+      - ".github/workflows/playwright.yml"
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playwright-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis-http:
+        image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+        env:
+          SRH_CONNECTION_STRING: redis://redis:6379
+          SRH_MODE: env
+          SRH_TOKEN: playwright-token
+        ports:
+          - 8079:80
+
+    env:
+      NODE_ENV: development
+      NODE_OPTIONS: --max_old_space_size=6144
+      NEXT_PUBLIC_BASE_URL: http://localhost:3000
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      AUTH_SECRET: secret
+      GOOGLE_CLIENT_ID: client_id
+      GOOGLE_CLIENT_SECRET: client_secret
+      GOOGLE_BASE_URL: http://localhost:4100
+      GOOGLE_PUBSUB_TOPIC_NAME: topic
+      EMAIL_ENCRYPT_SECRET: secret
+      EMAIL_ENCRYPT_SALT: salt
+      INTERNAL_API_KEY: secret
+      DEFAULT_LLMS: openai:gpt-5.4-mini
+      UPSTASH_REDIS_URL: http://localhost:8079
+      UPSTASH_REDIS_TOKEN: playwright-token
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find changed Playwright files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+
+          changed_files_path="$RUNNER_TEMP/changed-playwright-files.txt"
+          : > "$changed_files_path"
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" || "$GITHUB_EVENT_NAME" == "push" ]] &&
+            [[ -n "$BASE_SHA" ]] &&
+            [[ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$GITHUB_SHA" -- \
+              apps/web/__tests__/playwright | \
+              sed 's#^apps/web/##' \
+                > "$changed_files_path"
+          fi
+
+          {
+            echo "PLAYWRIGHT_CHANGED_TEST_FILES<<EOF"
+            cat "$changed_files_path"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: bash scripts/pnpm-install-without-desktop.sh --frozen-lockfile
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
+      - name: Setup Playwright cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Apply database migrations
+        run: pnpm -F inbox-zero-ai exec prisma migrate deploy
+
+      - name: Install Playwright browser
+        run: pnpm -F inbox-zero-ai exec playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        id: playwright_tests
+        run: pnpm -F inbox-zero-ai test:playwright:emulated
+
+      - name: Upload Playwright artifacts
+        if: always() && github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/web/playwright-report
+            apps/web/test-results
+          compression-level: 1
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Publish Playwright dashboard
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.S3_REGION }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
+          PLAYWRIGHT_RESULT: ${{ steps.playwright_tests.outcome }}
+          PLAYWRIGHT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PLAYWRIGHT_RUN_ID: ${{ github.run_id }}
+          PLAYWRIGHT_RUN_NUMBER: ${{ github.run_number }}
+          PLAYWRIGHT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PLAYWRIGHT_SHA: ${{ github.sha }}
+          PLAYWRIGHT_EVENT: ${{ github.event_name }}
+          PLAYWRIGHT_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f apps/web/playwright-report/index.html ]; then
+            echo "::warning::Playwright did not produce an HTML report; keeping the existing public dashboard."
+            exit 0
+          fi
+
+          dashboard_dir="$GITHUB_WORKSPACE/.tmp/playwright-dashboard"
+          history_path="$dashboard_dir/history.json"
+          dashboard_path="$dashboard_dir/index.html"
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bucket_uri="s3://${S3_BUCKET}/playwright"
+          public_base_url="https://${S3_BUCKET}.${S3_ENDPOINT#https://}/playwright"
+
+          mkdir -p "$dashboard_dir"
+          if aws s3 cp \
+            "$bucket_uri/history.json" \
+            "$history_path" \
+            --endpoint-url "$S3_ENDPOINT" \
+            2>"$dashboard_dir/history-download-error.log"; then
+            echo "Downloaded existing Playwright history."
+          elif grep -Eq "404|NoSuchKey|Not Found" "$dashboard_dir/history-download-error.log"; then
+            echo "No existing Playwright history found; creating it."
+          else
+            cat "$dashboard_dir/history-download-error.log"
+            exit 1
+          fi
+
+          PLAYWRIGHT_REPORT_URL="$public_base_url/runs/$run_key/index.html" \
+            pnpm -F inbox-zero-ai exec tsx \
+              scripts/generate-playwright-report-dashboard.ts \
+              "$history_path" \
+              "$dashboard_path"
+
+          aws s3 sync \
+            apps/web/playwright-report/ \
+            "$bucket_uri/runs/$run_key/" \
+            --endpoint-url "$S3_ENDPOINT" \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 sync \
+            apps/web/playwright-report/ \
+            "$bucket_uri/latest/" \
+            --endpoint-url "$S3_ENDPOINT" \
+            --delete \
+            --cache-control "no-cache"
+          aws s3 cp \
+            "$history_path" \
+            "$bucket_uri/history.json" \
+            --endpoint-url "$S3_ENDPOINT" \
+            --content-type "application/json" \
+            --cache-control "no-store"
+          aws s3 cp \
+            "$dashboard_path" \
+            "$bucket_uri/index.html" \
+            --endpoint-url "$S3_ENDPOINT" \
+            --content-type "text/html" \
+            --cache-control "no-store"
+
+          {
+            echo "### Playwright report"
+            echo "- [Dashboard]($public_base_url/index.html)"
+            echo "- [This run]($public_base_url/runs/$run_key/index.html)"
+            echo "- [Latest report]($public_base_url/latest/index.html)"
+          } >> "$GITHUB_STEP_SUMMARY"

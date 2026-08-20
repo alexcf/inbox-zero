@@ -81,7 +81,9 @@ import type { AttachmentSourceInput } from "@/utils/attachments/source-schema";
 import type { GetMessagingChannelsResponse } from "@/app/api/user/messaging-channels/route";
 import { usePremium } from "@/hooks/usePremium";
 import { hasTierAccess } from "@/utils/premium";
+import { shouldIncludeDigestAction } from "@/utils/premium/digest";
 import { UpgradeToPlusButton } from "@/components/UpgradeToPlusButton";
+import { useIntegrationActionsEnabled } from "@/hooks/useFeatureFlags";
 import { getConnectedRuleNotificationChannels } from "@/utils/messaging/routes";
 import { sortActionsByPriority } from "@/utils/action-sort";
 import {
@@ -132,6 +134,7 @@ export function RuleForm({
   onCancel?: () => void;
 }) {
   const { emailAccountId, provider } = useAccount();
+  const integrationActionsEnabled = useIntegrationActionsEnabled();
   const { tier, isLoading: isLoadingPremium } = usePremium();
   const hasDigestAccess = hasTierAccess({
     tier,
@@ -239,15 +242,16 @@ export function RuleForm({
         isDraftReplyActionType(action.type),
       );
 
-      // When the user lacks digest access the toggle is hidden, so preserve
-      // any existing DIGEST action rather than silently dropping it.
       const actionsToSubmit = [...normalizedActions];
       const existingDigestAction = rule.actions.find(
         (action) => action.type === ActionType.DIGEST,
       );
-      const includeDigestAction = hasDigestAccess
-        ? data.digest
-        : !!existingDigestAction;
+      const includeDigestAction = shouldIncludeDigestAction({
+        digestFeatureEnabled: !!env.NEXT_PUBLIC_DIGEST_ENABLED,
+        hasDigestAccess,
+        wantsDigest: !!data.digest,
+        hasExistingDigest: !!existingDigestAction,
+      });
       if (includeDigestAction) {
         actionsToSubmit.push({
           id: existingDigestAction?.id,
@@ -397,8 +401,11 @@ export function RuleForm({
         formState.errors?.actions?.[index]?.url?.root?.message ||
         formState.errors?.actions?.[index]?.labelId?.root?.message ||
         formState.errors?.actions?.[index]?.to?.root?.message ||
-        formState.errors?.actions?.[index]?.messagingChannelId?.message;
-      if (actionError) actionErrors.push(actionError);
+        formState.errors?.actions?.[index]?.messagingChannelId?.message ||
+        formState.errors?.actions?.[index]?.integrationArgs?.message ||
+        formState.errors?.actions?.[index]?.integrationArgs?.root?.message;
+      // react-hook-form widens a nested record's message to string | FieldError
+      if (typeof actionError === "string") actionErrors.push(actionError);
     });
     return actionErrors;
   }, [formState, watch]);
@@ -425,11 +432,18 @@ export function RuleForm({
         labelActionText: terminology.label.action,
         systemType: rule.systemType,
         existingActionTypes,
+        integrationActionsEnabled,
       }).map((option) => ({
         ...option,
         icon: getActionIcon(option.value),
       })),
-    [existingActionTypes, provider, terminology.label.action, rule.systemType],
+    [
+      existingActionTypes,
+      integrationActionsEnabled,
+      provider,
+      terminology.label.action,
+      rule.systemType,
+    ],
   );
 
   const [isNameEditMode, setIsNameEditMode] = useState(alwaysEditMode);
@@ -596,9 +610,14 @@ export function RuleForm({
                 {env.NEXT_PUBLIC_DIGEST_ENABLED && (
                   <AdvancedRow
                     title="Include in digest"
-                    description="Show matched emails in your digest summary."
+                    description={
+                      !hasDigestAccess && watch("digest")
+                        ? "Digests are available on the Plus plan. Turn this off to update this rule on your current plan."
+                        : "Show matched emails in your digest summary."
+                    }
                   >
-                    {isLoadingPremium ? null : hasDigestAccess ? (
+                    {isLoadingPremium ? null : hasDigestAccess ||
+                      watch("digest") ? (
                       <Toggle
                         name="digest"
                         enabled={watch("digest") || false}
@@ -935,6 +954,7 @@ function getRuleEditorActions(actions: CreateRuleBody["actions"]) {
 type ActionTypeOption = {
   label: string;
   value: ActionType;
+  dividerBefore?: boolean;
 };
 
 export function getRuleActionTypeOptions({
@@ -942,11 +962,13 @@ export function getRuleActionTypeOptions({
   labelActionText,
   systemType,
   existingActionTypes,
+  integrationActionsEnabled,
 }: {
   provider: string;
   labelActionText: string;
   systemType: SystemType | null | undefined;
   existingActionTypes: ActionType[];
+  integrationActionsEnabled: boolean;
 }): ActionTypeOption[] {
   const availableActions = new Set(
     getAvailableActionsForRuleEditor({
@@ -954,7 +976,12 @@ export function getRuleActionTypeOptions({
       existingActionTypes,
     }),
   );
-  const extraActions = new Set(getExtraAvailableActionsForRuleEditor());
+  const extraActions = new Set(
+    getExtraAvailableActionsForRuleEditor({
+      existingActionTypes,
+      integrationActionsEnabled,
+    }),
+  );
 
   return [
     {
@@ -1031,6 +1058,15 @@ export function getRuleActionTypeOptions({
           {
             label: ACTION_TYPE_LABELS[ActionType.CALL_WEBHOOK],
             value: ActionType.CALL_WEBHOOK,
+          },
+        ]
+      : []),
+    ...(extraActions.has(ActionType.INTEGRATION)
+      ? [
+          {
+            label: ACTION_TYPE_LABELS[ActionType.INTEGRATION],
+            value: ActionType.INTEGRATION,
+            dividerBefore: true,
           },
         ]
       : []),

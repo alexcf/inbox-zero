@@ -266,7 +266,19 @@ const parsedEnv = createEnv({
 
     POSTHOG_API_SECRET: z.string().optional(),
     POSTHOG_PROJECT_ID: z.string().optional(),
+    POSTHOG_FEEDBACK_SURVEY_ID: z.string().optional(),
+    POSTHOG_FEEDBACK_SURVEY_QUESTION_ID: z.string().optional(),
     POSTHOG_LLM_EVALS_APPROVED_EMAILS: z.string().optional(),
+    FEEDBACK_WEBHOOK_URL: z.string().url().optional(),
+
+    RECALL_API_KEY: z.string().optional(),
+    RECALL_WEBHOOK_SECRET: z.string().optional(),
+    RECALL_REGION: z
+      .string()
+      .regex(/^[a-z0-9-]+$/)
+      .optional(),
+    // Local Recall emulation only; points the bot provider at a stand-in API.
+    RECALL_BASE_URL: z.string().url().optional(),
 
     RESEND_API_KEY: z.string().optional(),
     RESEND_AUDIENCE_ID: z.string().optional(),
@@ -275,6 +287,10 @@ const parsedEnv = createEnv({
       .optional()
       .default("Inbox Zero <updates@transactional.getinboxzero.com>"),
     CRON_SECRET: z.string().optional(),
+    BLOG_SYNC_WEBHOOK_SECRET: z.string().min(1).optional(),
+    BLOG_SYNC_SANITY_AUTHOR_ID: z.string().min(1).optional(),
+    BLOG_SYNC_IMAGE_ALLOWED_HOSTS: z.string().optional(),
+    SANITY_API_WRITE_TOKEN: z.string().min(1).optional(),
     LOOPS_API_SECRET: z.string().optional(),
     FB_CONVERSION_API_ACCESS_TOKEN: z.string().optional(),
     FB_PIXEL_ID: z.string().optional(),
@@ -285,6 +301,7 @@ const parsedEnv = createEnv({
       .optional()
       .transform((value) => value?.split(",")),
     WEBHOOK_URL: z.string().optional(),
+    MCP_SERVER_URL_OVERRIDES: z.string().optional(),
     INTERNAL_API_URL: z.string().optional(),
     INTERNAL_API_KEY: z.string(),
     WHITELIST_FROM: z.string().optional(),
@@ -305,6 +322,13 @@ const parsedEnv = createEnv({
       ),
     // Mobile auth trusted origin, e.g. inboxzero://
     MOBILE_AUTH_ORIGIN: z.string().trim().min(1).optional(),
+    // Desktop Electron custom-scheme origin for system-browser OAuth return.
+    DESKTOP_AUTH_ORIGIN: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .default("inboxzero://"),
     AUTO_JOIN_ORGANIZATION_ENABLED: booleanString.optional().default(false),
     AUTO_ENABLE_ORG_ANALYTICS: booleanString.optional().default(false),
 
@@ -400,11 +424,13 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS: booleanString.optional(),
     NEXT_PUBLIC_DIGEST_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_MEETING_BRIEFS_ENABLED: booleanString.optional(),
+    NEXT_PUBLIC_MEETING_RECORDER_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_FOLLOW_UP_REMINDERS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_INTEGRATIONS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_SMART_FILING_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_CLEANER_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_DELETE_EMAIL_ACTION_ENABLED: booleanString.optional(),
+    NEXT_PUBLIC_INTEGRATION_ACTION_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_BOOKING_LINKS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_EXTERNAL_API_ENABLED: booleanString.optional().default(false),
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED: booleanString.optional(),
@@ -500,6 +526,8 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_DIGEST_ENABLED: process.env.NEXT_PUBLIC_DIGEST_ENABLED,
     NEXT_PUBLIC_MEETING_BRIEFS_ENABLED:
       process.env.NEXT_PUBLIC_MEETING_BRIEFS_ENABLED,
+    NEXT_PUBLIC_MEETING_RECORDER_ENABLED:
+      process.env.NEXT_PUBLIC_MEETING_RECORDER_ENABLED,
     NEXT_PUBLIC_FOLLOW_UP_REMINDERS_ENABLED:
       process.env.NEXT_PUBLIC_FOLLOW_UP_REMINDERS_ENABLED,
     NEXT_PUBLIC_INTEGRATIONS_ENABLED:
@@ -509,6 +537,8 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_CLEANER_ENABLED: process.env.NEXT_PUBLIC_CLEANER_ENABLED,
     NEXT_PUBLIC_DELETE_EMAIL_ACTION_ENABLED:
       process.env.NEXT_PUBLIC_DELETE_EMAIL_ACTION_ENABLED,
+    NEXT_PUBLIC_INTEGRATION_ACTION_ENABLED:
+      process.env.NEXT_PUBLIC_INTEGRATION_ACTION_ENABLED,
     NEXT_PUBLIC_BOOKING_LINKS_ENABLED:
       process.env.NEXT_PUBLIC_BOOKING_LINKS_ENABLED,
     NEXT_PUBLIC_EXTERNAL_API_ENABLED:

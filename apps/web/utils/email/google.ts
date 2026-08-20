@@ -1,4 +1,5 @@
 import type { gmail_v1 } from "@googleapis/gmail";
+import chunk from "lodash/chunk";
 import type { Attachment as MailAttachment } from "nodemailer/lib/mailer";
 import type { MessageWithPayload, ParsedMessage } from "@/utils/types";
 import { parseMessage } from "@/utils/gmail/message";
@@ -42,8 +43,9 @@ import {
   labelThread,
   markReadThread,
   removeThreadLabel,
+  unarchiveThread,
 } from "@/utils/gmail/label";
-import { trashThread } from "@/utils/gmail/trash";
+import { trashThread, untrashThread } from "@/utils/gmail/trash";
 import { markSpam } from "@/utils/gmail/spam";
 import { handlePreviousDraftDeletion } from "@/utils/ai/choose-rule/draft-management";
 import {
@@ -59,7 +61,11 @@ import {
 } from "@/utils/gmail/thread";
 import { decodeSnippet } from "@/utils/gmail/decode";
 import { getDraft, deleteDraft, sendDraft } from "@/utils/gmail/draft";
-import { extractErrorInfo, withGmailRetry } from "@/utils/gmail/retry";
+import {
+  extractErrorInfo,
+  isRetryableError,
+  withGmailRetry,
+} from "@/utils/gmail/retry";
 import { getLatestNonDraftMessage } from "@/utils/email/latest-message";
 import { getMessageTimestamp } from "@/utils/email/message-timestamp";
 import {
@@ -76,12 +82,15 @@ import type {
   EmailFilter,
   EmailSignature,
   SentMessagePage,
+  BulkArchiveThread,
+  BulkArchiveResult,
 } from "@/utils/email/types";
 import { createScopedLogger, type Logger } from "@/utils/logger";
 import { getGmailSignatures } from "@/utils/gmail/signature-settings";
 import { withRateLimitRecording } from "@/utils/email/rate-limit";
 import { shouldSkipAutoDraft } from "@/utils/auto-draft";
 import { extractUniqueEmailAddresses } from "@/utils/email";
+import { getGmailMailboxSyncPage } from "@/utils/gmail/mailbox-sync";
 
 export class GmailProvider implements EmailProvider {
   readonly name = "google";
@@ -158,6 +167,7 @@ export class GmailProvider implements EmailProvider {
           id: label.id!,
           name: label.name!,
           type: label.type!,
+          color: label.color || undefined,
           threadsTotal: label.threadsTotal || undefined,
           labelListVisibility: label.labelListVisibility || undefined,
           messageListVisibility: label.messageListVisibility || undefined,
@@ -175,7 +185,9 @@ export class GmailProvider implements EmailProvider {
         id: label.id!,
         name: label.name!,
         type: label.type!,
+        color: label.color || undefined,
         threadsTotal: label.threadsTotal || undefined,
+        threadsUnread: label.threadsUnread || undefined,
       };
     } catch {
       return null;
@@ -189,6 +201,7 @@ export class GmailProvider implements EmailProvider {
       id: label.id!,
       name: label.name!,
       type: label.type!,
+      color: label.color || undefined,
       threadsTotal: label.threadsTotal || undefined,
       labelListVisibility: label.labelListVisibility || undefined,
       messageListVisibility: label.messageListVisibility || undefined,
@@ -315,6 +328,89 @@ export class GmailProvider implements EmailProvider {
       actionSource: "user",
       labelId,
     });
+  }
+
+  async unarchiveThread(threadId: string): Promise<void> {
+    await unarchiveThread({ gmail: this.client, threadId });
+  }
+
+  async untrashThread(threadId: string): Promise<void> {
+    await untrashThread({ gmail: this.client, threadId });
+  }
+
+  async bulkArchiveThreads(
+    threads: BulkArchiveThread[],
+    ownerEmail: string,
+  ): Promise<BulkArchiveResult> {
+    const threadIdsByMessageId = new Map<string, Set<string>>();
+    const failedThreadIds = new Set<string>();
+
+    for (const thread of threads) {
+      if (thread.messageIds.length === 0) {
+        failedThreadIds.add(thread.threadId);
+      }
+      for (const messageId of thread.messageIds) {
+        const threadIds = threadIdsByMessageId.get(messageId) ?? new Set();
+        threadIds.add(thread.threadId);
+        threadIdsByMessageId.set(messageId, threadIds);
+      }
+    }
+
+    const messageIdChunks = chunk([...threadIdsByMessageId.keys()], 1000);
+    for (let index = 0; index < messageIdChunks.length; index++) {
+      const messageIds = messageIdChunks[index];
+
+      try {
+        await this.withRateLimitTracking("bulk-archive-threads", () =>
+          withGmailRetry(() =>
+            this.client.users.messages.batchModify({
+              userId: "me",
+              requestBody: {
+                ids: messageIds,
+                removeLabelIds: [GmailLabel.INBOX],
+              },
+            }),
+          ),
+        );
+      } catch (error) {
+        for (const messageId of messageIds) {
+          for (const threadId of threadIdsByMessageId.get(messageId) ?? []) {
+            failedThreadIds.add(threadId);
+          }
+        }
+
+        if (isRetryableError(extractErrorInfo(error)).isRateLimit) {
+          for (const remainingMessageIds of messageIdChunks.slice(index + 1)) {
+            for (const messageId of remainingMessageIds) {
+              for (const threadId of threadIdsByMessageId.get(messageId) ??
+                []) {
+                failedThreadIds.add(threadId);
+              }
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    const succeededThreadIds = threads
+      .map((thread) => thread.threadId)
+      .filter((threadId) => !failedThreadIds.has(threadId));
+
+    if (succeededThreadIds.length > 0) {
+      await publishBulkActionToTinybird({
+        threadIds: succeededThreadIds,
+        action: "archive",
+        ownerEmail,
+      });
+    }
+
+    return {
+      succeededThreadIds,
+      failedThreadIds: threads
+        .map((thread) => thread.threadId)
+        .filter((threadId) => failedThreadIds.has(threadId)),
+    };
   }
 
   async archiveMessage(messageId: string): Promise<void> {
@@ -1281,6 +1377,19 @@ export class GmailProvider implements EmailProvider {
     });
   }
 
+  async getMailboxSyncPage(options: {
+    after?: Date;
+    cursor?: string;
+    limit: number;
+  }) {
+    return getGmailMailboxSyncPage({
+      gmail: this.client,
+      accessToken: getAccessTokenFromClient(this.client),
+      logger: this.logger,
+      ...options,
+    });
+  }
+
   getAccessToken(): string {
     return getAccessTokenFromClient(this.client);
   }
@@ -1364,6 +1473,7 @@ export class GmailProvider implements EmailProvider {
     query?: ThreadsQuery;
     maxResults?: number;
     pageToken?: string;
+    messageFormat?: "full" | "metadata";
   }): Promise<{
     threads: EmailThread[];
     nextPageToken?: string;
@@ -1415,9 +1525,10 @@ export class GmailProvider implements EmailProvider {
       }
 
       function getLabelIds(type?: string | null) {
-        if (labelIds) {
+        if (labelIds?.length) {
           return labelIds;
         }
+        if (labelId) return [labelId];
 
         switch (type) {
           case "inbox":
@@ -1451,7 +1562,7 @@ export class GmailProvider implements EmailProvider {
         await getThreadsWithNextPageToken({
           gmail: this.client,
           q: getQuery(),
-          labelIds: labelId ? [labelId] : getLabelIds(type) || [],
+          labelIds: getLabelIds(type) || [],
           maxResults: options.maxResults || 50,
           pageToken: options.pageToken || undefined,
           logger: this.logger,
@@ -1463,6 +1574,9 @@ export class GmailProvider implements EmailProvider {
         threadIds,
         getAccessTokenFromClient(this.client),
         this.logger,
+        options.messageFormat === "metadata"
+          ? { format: "metadata" }
+          : undefined,
       );
 
       const emailThreads: EmailThread[] = threads
@@ -1539,6 +1653,10 @@ export class GmailProvider implements EmailProvider {
 
   async getFolders() {
     this.logger.warn("Getting folders is not supported for Gmail");
+    return [];
+  }
+
+  async getFolderCounts() {
     return [];
   }
 

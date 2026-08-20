@@ -2,11 +2,16 @@ import { render } from "@react-email/render";
 import { nanoid } from "nanoid";
 import { resend } from "./client";
 import type { ReactElement } from "react";
+import type { Attachment } from "resend";
 import SummaryEmail, { type SummaryEmailProps } from "../emails/summary";
 import DigestEmail, {
   type DigestEmailProps,
   generateDigestSubject,
 } from "../emails/digest";
+import InboxHealthEmail, {
+  getSenderCountText,
+  type InboxHealthEmailProps,
+} from "../emails/inbox-health";
 import InvitationEmail, {
   type InvitationEmailProps,
 } from "../emails/invitation";
@@ -20,6 +25,10 @@ import MeetingBriefingEmail, {
   type MeetingBriefingEmailProps,
   generateMeetingBriefingSubject,
 } from "../emails/meeting-briefing";
+import MeetingRecapEmail, {
+  type MeetingRecapEmailProps,
+  generateMeetingRecapSubject,
+} from "../emails/meeting-recap";
 import ColdEmailNotification, {
   type ColdEmailNotificationProps,
 } from "../emails/cold-email-notification";
@@ -38,6 +47,7 @@ import GuestBookingRescheduledEmail, {
 import HostBookingRescheduledEmail, {
   type HostBookingRescheduledEmailProps,
 } from "../emails/host-booking-rescheduled";
+import InvoiceEmail, { type InvoiceEmailProps } from "../emails/invoice";
 
 const RESEND_NOT_CONFIGURED_MESSAGE =
   "Resend is not configured. You need to add a RESEND_API_KEY in your .env file for emails to work.";
@@ -100,6 +110,8 @@ const sendTransactionalEmail = async ({
   react,
   test,
   tags,
+  attachments,
+  idempotencyKey,
 }: {
   from: string;
   to: string;
@@ -107,6 +119,8 @@ const sendTransactionalEmail = async ({
   react: ReactElement;
   test?: boolean;
   tags?: { name: string; value: string }[];
+  attachments?: Attachment[];
+  idempotencyKey?: string;
 }) => {
   if (!resend) {
     console.log(RESEND_NOT_CONFIGURED_MESSAGE);
@@ -115,17 +129,21 @@ const sendTransactionalEmail = async ({
 
   const text = await render(react, { plainText: true });
 
-  const result = await resend.emails.send({
-    from,
-    to: test ? "delivered@resend.dev" : to,
-    subject,
-    react,
-    text,
-    headers: {
-      "X-Entity-Ref-ID": nanoid(),
+  const result = await resend.emails.send(
+    {
+      from,
+      to: test ? "delivered@resend.dev" : to,
+      subject,
+      react,
+      text,
+      attachments,
+      headers: {
+        "X-Entity-Ref-ID": nanoid(),
+      },
+      tags,
     },
-    tags,
-  });
+    idempotencyKey ? { idempotencyKey } : undefined,
+  );
 
   if (result.error) {
     console.error("Error sending email", result.error);
@@ -210,6 +228,33 @@ export const sendDigestEmail = async ({
       {
         name: "category",
         value: "digest",
+      },
+    ],
+  });
+
+export const sendInboxHealthEmail = async ({
+  from,
+  to,
+  test,
+  emailProps,
+}: {
+  from: string;
+  to: string;
+  test?: boolean;
+  emailProps: InboxHealthEmailProps;
+}) =>
+  sendEmail({
+    from,
+    to,
+    subject: `We found ${getSenderCountText(emailProps.suggestionCount)} you rarely read`,
+    react: <InboxHealthEmail {...emailProps} />,
+    test,
+    unsubscribeToken: emailProps.unsubscribeToken,
+    baseUrl: emailProps.baseUrl,
+    tags: [
+      {
+        name: "category",
+        value: "inbox-health",
       },
     ],
   });
@@ -318,6 +363,33 @@ export const sendMeetingBriefingEmail = async ({
       {
         name: "category",
         value: "meeting-briefing",
+      },
+    ],
+  });
+
+export const sendMeetingRecapEmail = async ({
+  from,
+  to,
+  test,
+  emailProps,
+}: {
+  from: string;
+  to: string;
+  test?: boolean;
+  emailProps: MeetingRecapEmailProps;
+}) =>
+  sendEmail({
+    from,
+    to,
+    subject: generateMeetingRecapSubject(emailProps),
+    react: <MeetingRecapEmail {...emailProps} />,
+    test,
+    unsubscribeToken: emailProps.unsubscribeToken,
+    baseUrl: emailProps.baseUrl,
+    tags: [
+      {
+        name: "category",
+        value: "meeting-recap",
       },
     ],
   });
@@ -477,4 +549,32 @@ export const sendHostBookingRescheduledEmail = async ({
     react: <HostBookingRescheduledEmail {...emailProps} />,
     test,
     tags: [{ name: "category", value: "booking-rescheduled" }],
+  });
+
+export const sendInvoiceEmail = async ({
+  from,
+  to,
+  test,
+  emailProps,
+  attachmentUrl,
+  idempotencyKey,
+}: {
+  from: string;
+  to: string;
+  test?: boolean;
+  emailProps: InvoiceEmailProps;
+  attachmentUrl?: string;
+  idempotencyKey: string;
+}) =>
+  sendTransactionalEmail({
+    from,
+    to,
+    subject: "Your Inbox Zero invoice",
+    react: <InvoiceEmail {...emailProps} />,
+    test,
+    attachments: attachmentUrl
+      ? [{ filename: "invoice.pdf", path: attachmentUrl }]
+      : undefined,
+    idempotencyKey,
+    tags: [{ name: "category", value: "invoice" }],
   });

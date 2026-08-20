@@ -10,6 +10,7 @@ import {
   getCategoryMap,
   getFolderIds,
   convertMessage,
+  MESSAGE_LIST_SELECT_FIELDS,
   MESSAGE_SELECT_FIELDS,
   sanitizeKqlValue,
 } from "@/utils/outlook/message";
@@ -19,6 +20,7 @@ import {
   createLabel,
   getOrCreateInboxZeroLabel,
   getLabelById,
+  OUTLOOK_COLOR_MAP,
 } from "@/utils/outlook/label";
 import type { InboxZeroLabel } from "@/utils/label";
 import type { ThreadsQuery } from "@/utils/threads/validation";
@@ -34,9 +36,11 @@ import {
 import {
   archiveThread,
   labelMessage,
-  markStarredMessage,
   markReadThread,
+  markStarredMessage,
   removeThreadLabel,
+  unarchiveThread,
+  untrashThread,
 } from "@/utils/outlook/label";
 import { trashThread } from "@/utils/outlook/trash";
 import { markSpam } from "@/utils/outlook/spam";
@@ -62,7 +66,10 @@ import type {
   EmailLabel,
   EmailFilter,
   EmailSignature,
+  EmailFolderCount,
   SentMessagePage,
+  BulkArchiveThread,
+  BulkArchiveResult,
 } from "@/utils/email/types";
 import { unwatchOutlook, watchOutlook } from "@/utils/outlook/watch";
 import { escapeODataString } from "@/utils/outlook/odata-escape";
@@ -74,15 +81,21 @@ import {
 import {
   getOrCreateOutlookFolderIdByName,
   getOutlookFolderTree,
+  addOutlookSystemFolderTypes,
 } from "@/utils/outlook/folders";
 import { extractSignatureFromHtml } from "@/utils/email/signature-extraction";
-import { moveMessagesForSenders } from "@/utils/outlook/batch";
+import {
+  moveMessagesForSenders,
+  moveThreadsInBatches,
+} from "@/utils/outlook/batch";
 import {
   extractErrorInfo,
   isRetryableError,
-  withOutlookRetry,
-} from "@/utils/outlook/retry";
+  withMicrosoftGraphRetry,
+  withMicrosoftGraphWriteRetry,
+} from "@/utils/microsoft/retry";
 import { shouldSkipAutoDraft } from "@/utils/auto-draft";
+import { getOutlookMailboxSyncPage } from "@/utils/outlook/mailbox-sync";
 
 export class OutlookProvider implements EmailProvider {
   readonly name = "microsoft";
@@ -152,6 +165,7 @@ export class OutlookProvider implements EmailProvider {
       id: label.id || "",
       name: label.displayName || "",
       type: "user",
+      color: mapOutlookPresetColor(label.color),
     }));
   }
 
@@ -167,6 +181,7 @@ export class OutlookProvider implements EmailProvider {
       id: category.id || "",
       name: category.displayName || "",
       type: "user",
+      color: mapOutlookPresetColor(category.color),
     };
   }
 
@@ -263,11 +278,11 @@ export class OutlookProvider implements EmailProvider {
       includeDrafts: false,
     });
 
-    const response: { value: Message[] } = await withOutlookRetry(
+    const response: { value: Message[] } = await withMicrosoftGraphRetry(
       () =>
         this.client
           .getClient()
-          .api("/me/mailFolders('sentitems')/messages")
+          .api("/me/mailFolders/sentitems/messages")
           .select(MESSAGE_SELECT_FIELDS)
           .top(maxResults)
           .orderby("sentDateTime desc")
@@ -285,11 +300,11 @@ export class OutlookProvider implements EmailProvider {
       includeDrafts: false,
     });
 
-    const response: { value: Message[] } = await withOutlookRetry(
+    const response: { value: Message[] } = await withMicrosoftGraphRetry(
       () =>
         this.client
           .getClient()
-          .api("/me/mailFolders('inbox')/messages")
+          .api("/me/mailFolders/inbox/messages")
           .select(MESSAGE_SELECT_FIELDS)
           .top(maxResults)
           .orderby("receivedDateTime desc")
@@ -323,7 +338,7 @@ export class OutlookProvider implements EmailProvider {
 
       let request = this.client
         .getClient()
-        .api("/me/mailFolders('sentitems')/messages")
+        .api("/me/mailFolders/sentitems/messages")
         .select("id,conversationId")
         .top(maxResults)
         .orderby("sentDateTime desc");
@@ -338,7 +353,7 @@ export class OutlookProvider implements EmailProvider {
     const response: {
       value?: { id?: string; conversationId?: string }[];
       "@odata.nextLink"?: string;
-    } = await withOutlookRetry(() => buildRequest().get(), this.logger);
+    } = await withMicrosoftGraphRetry(() => buildRequest().get(), this.logger);
 
     return {
       messages: (response.value || []).flatMap((m) =>
@@ -383,7 +398,7 @@ export class OutlookProvider implements EmailProvider {
 
     // Get messages from Microsoft Graph API (well-known Sent Items folder)
     let request = client
-      .api("/me/mailFolders('sentitems')/messages")
+      .api("/me/mailFolders/sentitems/messages")
       .select(MESSAGE_SELECT_FIELDS)
       .top(maxResults)
       .orderby("sentDateTime desc");
@@ -440,6 +455,35 @@ export class OutlookProvider implements EmailProvider {
     });
   }
 
+  async unarchiveThread(threadId: string): Promise<void> {
+    await unarchiveThread({
+      client: this.client,
+      threadId,
+      logger: this.logger,
+    });
+  }
+
+  async untrashThread(threadId: string): Promise<void> {
+    await untrashThread({
+      client: this.client,
+      threadId,
+      logger: this.logger,
+    });
+  }
+
+  async bulkArchiveThreads(
+    threads: BulkArchiveThread[],
+    ownerEmail: string,
+  ): Promise<BulkArchiveResult> {
+    return moveThreadsInBatches({
+      client: this.client,
+      threads,
+      destinationId: "archive",
+      ownerEmail,
+      logger: this.logger,
+    });
+  }
+
   async trashThread(
     threadId: string,
     ownerEmail: string,
@@ -486,7 +530,7 @@ export class OutlookProvider implements EmailProvider {
     }
 
     // Get current message categories to avoid replacing them
-    const message = await withOutlookRetry(
+    const message = await withMicrosoftGraphRetry(
       () =>
         this.client
           .getClient()
@@ -551,10 +595,11 @@ export class OutlookProvider implements EmailProvider {
     this.logger.info("Creating draft", {
       replyToMessageId: params.replyToMessageId,
     });
+    const toRecipients = toGraphRecipients(params.to, this.logger);
 
     // For threading, use createReply on the replyToMessageId
     if (params.replyToMessageId) {
-      const draft = await withOutlookRetry(
+      const draft = await withMicrosoftGraphWriteRetry(
         () =>
           this.client
             .getClient()
@@ -564,7 +609,7 @@ export class OutlookProvider implements EmailProvider {
       );
 
       // Update the draft with our content
-      await withOutlookRetry(
+      await withMicrosoftGraphWriteRetry(
         () =>
           this.client
             .getClient()
@@ -572,7 +617,7 @@ export class OutlookProvider implements EmailProvider {
             .patch({
               body: { contentType: "html", content: params.messageHtml },
               subject: params.subject,
-              toRecipients: [{ emailAddress: { address: params.to } }],
+              toRecipients,
             }),
         this.logger,
       );
@@ -582,7 +627,7 @@ export class OutlookProvider implements EmailProvider {
     }
 
     // Otherwise create standalone draft
-    const draft = await withOutlookRetry(
+    const draft = await withMicrosoftGraphWriteRetry(
       () =>
         this.client
           .getClient()
@@ -590,7 +635,7 @@ export class OutlookProvider implements EmailProvider {
           .post({
             subject: params.subject,
             body: { contentType: "html", content: params.messageHtml },
-            toRecipients: [{ emailAddress: { address: params.to } }],
+            toRecipients,
           }),
       this.logger,
     );
@@ -616,7 +661,7 @@ export class OutlookProvider implements EmailProvider {
       body.subject = params.subject;
     }
 
-    await withOutlookRetry(
+    await withMicrosoftGraphWriteRetry(
       () => this.client.getClient().api(`/me/messages/${draftId}`).patch(body),
       this.logger,
     );
@@ -1374,6 +1419,18 @@ export class OutlookProvider implements EmailProvider {
     return Promise.all(messagePromises);
   }
 
+  async getMailboxSyncPage(options: {
+    after?: Date;
+    cursor?: string;
+    limit: number;
+  }) {
+    return getOutlookMailboxSyncPage({
+      client: this.client,
+      logger: this.logger,
+      ...options,
+    });
+  }
+
   getAccessToken(): string {
     return this.client.getAccessToken();
   }
@@ -1471,6 +1528,7 @@ export class OutlookProvider implements EmailProvider {
     query?: ThreadsQuery;
     maxResults?: number;
     pageToken?: string;
+    messageFormat?: "full" | "metadata";
   }): Promise<{
     threads: EmailThread[];
     nextPageToken?: string;
@@ -1481,6 +1539,8 @@ export class OutlookProvider implements EmailProvider {
       before,
       isUnread,
       type,
+      folderId,
+      inboxSection,
       labelId,
       labelIds,
       excludeLabelNames,
@@ -1543,10 +1603,14 @@ export class OutlookProvider implements EmailProvider {
 
       // Route to appropriate endpoint based on type
       // parentFolderId on messages is a GUID, not a well-known name — always resolve
-      if (type === "sent" && !hasExplicitLabelFilters) {
-        endpoint = "/me/mailFolders('sentitems')/messages";
+      if (folderId) {
+        endpoint = `/me/mailFolders/${encodeURIComponent(folderId)}/messages`;
+      } else if (inboxSection && !hasExplicitLabelFilters) {
+        endpoint = "/me/mailFolders/inbox/messages";
+      } else if (type === "sent" && !hasExplicitLabelFilters) {
+        endpoint = "/me/mailFolders/sentitems/messages";
       } else {
-        if (labelId) {
+        if (labelId && !labelIds?.length) {
           const labelFilter = await resolveOutlookThreadQueryFilter({
             client: this.client,
             folderIds: resolvedFolderIds,
@@ -1580,11 +1644,19 @@ export class OutlookProvider implements EmailProvider {
         filters.push("isRead eq false");
       }
 
+      if (inboxSection && !folderId) {
+        filters.push(`inferenceClassification eq '${inboxSection}'`);
+      }
+
       const filter = filters.length > 0 ? filters.join(" and ") : undefined;
 
       let request = client
         .api(endpoint)
-        .select(MESSAGE_SELECT_FIELDS)
+        .select(
+          options.messageFormat === "metadata"
+            ? MESSAGE_LIST_SELECT_FIELDS
+            : MESSAGE_SELECT_FIELDS,
+        )
         .top(maxResults);
 
       if (filter) {
@@ -1695,113 +1767,39 @@ export class OutlookProvider implements EmailProvider {
     date: Date;
     messageId: string;
   }): Promise<boolean> {
-    try {
-      // Use shared logic: for public domains search by full email, for company domains search by domain
-      const searchTerm = getSearchTermForSender(options.from);
-      const isFullEmail = searchTerm.includes("@");
+    // Use shared logic: for public domains search by full email, for company domains search by domain
+    const searchTerm = getSearchTermForSender(options.from);
+    const isFullEmail = searchTerm.includes("@");
 
-      const dateString = options.date.toISOString();
+    const dateString = options.date.toISOString();
 
-      // For domain matching, use $search instead of $filter since endsWith has limitations
-      // For exact email matching, use $filter with eq (case-insensitive for email addresses)
-      if (!isFullEmail) {
-        // Domain-based search - use $search for both sent and received
-        const escapedKqlDomain = searchTerm
-          .replace(/\\/g, "\\\\")
-          .replace(/"/g, '\\"');
-
-        const [sentResponse, receivedResponse] = await Promise.all([
-          this.client
-            .getClient()
-            .api("/me/messages")
-            .search(`"to:@${escapedKqlDomain}"`)
-            .top(5)
-            .select("id,sentDateTime")
-            .get()
-            .catch((error) => {
-              this.logger.warn("Error checking sent messages (domain)", {
-                error,
-              });
-              return { value: [] };
-            }),
-
-          this.client
-            .getClient()
-            .api("/me/messages")
-            .search(`"from:@${escapedKqlDomain}"`)
-            .top(5)
-            .select("id,receivedDateTime")
-            .get()
-            .catch((error) => {
-              this.logger.warn("Error checking received messages (domain)", {
-                error,
-              });
-              return { value: [] };
-            }),
-        ]);
-
-        // Filter by date since $search doesn't support date filtering well
-        const validSentMessages = (sentResponse.value || []).filter(
-          (msg: Message) => {
-            if (!msg.sentDateTime) return false;
-            return new Date(msg.sentDateTime) < options.date;
-          },
-        );
-
-        const validReceivedMessages = (receivedResponse.value || []).filter(
-          (msg: Message) => {
-            if (!msg.receivedDateTime) return false;
-            return new Date(msg.receivedDateTime) < options.date;
-          },
-        );
-
-        const messages = [...validSentMessages, ...validReceivedMessages];
-        return messages.some((message) => message.id !== options.messageId);
-      }
-
-      // Full email search - use $filter for received, $search for sent
-      const escapedSearchTerm = escapeODataString(searchTerm);
-      const receivedFilter = `from/emailAddress/address eq '${escapedSearchTerm}' and receivedDateTime lt ${dateString}`;
-
-      // Use $search for sent messages as $filter on toRecipients is unreliable
-      const escapedKqlSearchTerm = searchTerm
+    // For domain matching, use $search instead of $filter since endsWith has limitations
+    // For exact email matching, use $filter with eq (case-insensitive for email addresses)
+    if (!isFullEmail) {
+      // Domain-based search - use $search for both sent and received
+      const escapedKqlDomain = searchTerm
         .replace(/\\/g, "\\\\")
         .replace(/"/g, '\\"');
-      const sentSearch = `"to:${escapedKqlSearchTerm}"`;
 
       const [sentResponse, receivedResponse] = await Promise.all([
         this.client
           .getClient()
           .api("/me/messages")
-          .search(sentSearch)
-          .top(5) // Increase top to account for potential future messages we filter out
+          .search(`"to:@${escapedKqlDomain}"`)
+          .top(5)
           .select("id,sentDateTime")
-          .get()
-          .catch((error) => {
-            this.logger.warn("Error checking sent messages", {
-              error,
-              search: sentSearch,
-            });
-            return { value: [] };
-          }),
+          .get(),
 
         this.client
           .getClient()
           .api("/me/messages")
-          .filter(receivedFilter)
-          .top(2)
-          .select("id")
-          .get()
-          .catch((error) => {
-            this.logger.warn("Error checking received messages", {
-              error,
-              filter: receivedFilter,
-            });
-            return { value: [] };
-          }),
+          .search(`"from:@${escapedKqlDomain}"`)
+          .top(5)
+          .select("id,receivedDateTime")
+          .get(),
       ]);
 
-      // Filter sent messages by date since $search doesn't support date filtering well
+      // Filter by date since $search doesn't support date filtering well
       const validSentMessages = (sentResponse.value || []).filter(
         (msg: Message) => {
           if (!msg.sentDateTime) return false;
@@ -1809,18 +1807,56 @@ export class OutlookProvider implements EmailProvider {
         },
       );
 
-      const messages = [
-        ...validSentMessages,
-        ...(receivedResponse.value || []),
-      ];
+      const validReceivedMessages = (receivedResponse.value || []).filter(
+        (msg: Message) => {
+          if (!msg.receivedDateTime) return false;
+          return new Date(msg.receivedDateTime) < options.date;
+        },
+      );
 
+      const messages = [...validSentMessages, ...validReceivedMessages];
       return messages.some((message) => message.id !== options.messageId);
-    } catch (error) {
-      this.logger.warn("Error checking previous communications", {
-        error,
-      });
-      return false;
     }
+
+    // Full email search - use $filter for received, $search for sent
+    const escapedSearchTerm = escapeODataString(searchTerm);
+    const receivedFilter = `from/emailAddress/address eq '${escapedSearchTerm}' and receivedDateTime lt ${dateString}`;
+
+    // Use $search for sent messages as $filter on toRecipients is unreliable
+    const escapedKqlSearchTerm = searchTerm
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
+    const sentSearch = `"to:${escapedKqlSearchTerm}"`;
+
+    const [sentResponse, receivedResponse] = await Promise.all([
+      this.client
+        .getClient()
+        .api("/me/messages")
+        .search(sentSearch)
+        .top(5) // Increase top to account for potential future messages we filter out
+        .select("id,sentDateTime")
+        .get(),
+
+      this.client
+        .getClient()
+        .api("/me/messages")
+        .filter(receivedFilter)
+        .top(2)
+        .select("id")
+        .get(),
+    ]);
+
+    // Filter sent messages by date since $search doesn't support date filtering well
+    const validSentMessages = (sentResponse.value || []).filter(
+      (msg: Message) => {
+        if (!msg.sentDateTime) return false;
+        return new Date(msg.sentDateTime) < options.date;
+      },
+    );
+
+    const messages = [...validSentMessages, ...(receivedResponse.value || [])];
+
+    return messages.some((message) => message.id !== options.messageId);
   }
 
   async getThreadsFromSenderWithSubject(
@@ -1970,7 +2006,22 @@ export class OutlookProvider implements EmailProvider {
   }
 
   async getFolders() {
-    return await getOutlookFolderTree(this.client, undefined, this.logger);
+    const [folders, folderIds] = await Promise.all([
+      getOutlookFolderTree(this.client, undefined, this.logger),
+      getFolderIds(this.client, this.logger),
+    ]);
+    return addOutlookSystemFolderTypes(folders, folderIds);
+  }
+
+  async getFolderCounts(): Promise<EmailFolderCount[]> {
+    const folders = await this.getFolders();
+    return flattenOutlookFolders(folders).map((folder) => ({
+      id: folder.id,
+      name: folder.displayName,
+      total: folder.totalItemCount ?? 0,
+      unread: folder.unreadItemCount ?? 0,
+      systemType: folder.systemType,
+    }));
   }
 
   async getSignatures(): Promise<EmailSignature[]> {
@@ -2009,11 +2060,11 @@ export class OutlookProvider implements EmailProvider {
   }
 
   async getInboxStats(): Promise<{ total: number; unread: number }> {
-    const folder = await withOutlookRetry(
+    const folder = await withMicrosoftGraphRetry(
       () =>
         this.client
           .getClient()
-          .api("/me/mailFolders('inbox')")
+          .api("/me/mailFolders/inbox")
           .select("totalItemCount,unreadItemCount")
           .get(),
       this.logger,
@@ -2041,6 +2092,15 @@ function resolveOutlookFolderId(
 ): string | undefined {
   const folderKey = LABEL_TO_FOLDER_KEY[labelId.toUpperCase()];
   return folderKey ? folderIds[folderKey] : undefined;
+}
+
+function flattenOutlookFolders(
+  folders: Awaited<ReturnType<OutlookProvider["getFolders"]>>,
+): Awaited<ReturnType<OutlookProvider["getFolders"]>> {
+  return folders.flatMap((folder) => [
+    folder,
+    ...flattenOutlookFolders(folder.childFolders),
+  ]);
 }
 
 function filterMessagesForParticipant(
@@ -2081,8 +2141,8 @@ function getRequiredOutlookThreadLabelIds({
   labelIds,
   type,
 }: Pick<ThreadsQuery, "labelId" | "labelIds" | "type">): string[] | undefined {
-  if (labelId) return [labelId];
   if (labelIds?.length) return labelIds;
+  if (labelId) return [labelId];
 
   switch (type) {
     case "all":
@@ -2457,4 +2517,46 @@ function parseOutlookThreadPageToken(
   } catch {
     return;
   }
+}
+
+// Graph needs one entry per recipient. Callers pass the same comma-separated
+// string the Gmail RFC-822 path accepts, so split it rather than sending the
+// whole list as a single malformed address.
+function toGraphRecipients(to: string, logger: Logger) {
+  const candidates = splitRecipientList(to);
+  const parsed = candidates.map((candidate) => ({
+    candidate,
+    email: extractEmailAddress(candidate),
+  }));
+  const recipients = parsed
+    .filter(({ email }) => email.length > 0)
+    .map(({ email }) => ({ emailAddress: { address: email } }));
+
+  if (candidates.length > 0 && recipients.length === 0) {
+    throw new Error("No valid recipient email addresses");
+  }
+
+  // A malformed attendee is dropped rather than failing the whole draft: the
+  // user reviews the draft before sending, so a missing recipient is
+  // recoverable while a missing draft is not.
+  const dropped = parsed.filter(({ email }) => email.length === 0);
+  if (dropped.length > 0) {
+    logger.warn("Dropped recipients without a parseable email address", {
+      droppedCount: dropped.length,
+    });
+    logger.trace("Dropped malformed recipients", {
+      dropped: dropped.map(({ candidate }) => candidate),
+    });
+  }
+
+  return recipients;
+}
+
+function mapOutlookPresetColor(
+  preset: string | null | undefined,
+): EmailLabel["color"] {
+  const backgroundColor =
+    preset && OUTLOOK_COLOR_MAP[preset as keyof typeof OUTLOOK_COLOR_MAP];
+  if (!backgroundColor) return;
+  return { backgroundColor, textColor: null };
 }

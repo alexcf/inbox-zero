@@ -7,9 +7,11 @@ import { createContact as createLoopsContact } from "@inboxzero/loops";
 import { createContact as createResendContact } from "@inboxzero/resend";
 import type { Account, AuthContext } from "better-auth";
 import { APIError, betterAuth } from "better-auth";
+import { createAuthMiddleware } from "better-auth/api";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { nextCookies } from "better-auth/next-js";
 import { cookies, headers } from "next/headers";
+import { after } from "next/server";
 import { env } from "@/env";
 import {
   assertAllowedAuthSignupEmail,
@@ -47,6 +49,12 @@ import { getEnabledLoginProviders } from "@/utils/oauth/login-providers";
 import { getAppleClientSecret } from "@/utils/auth/apple-client-secret";
 import { assertCanGenerateScimToken } from "@/utils/auth/scim";
 import prisma from "@/utils/prisma";
+import {
+  getAuthProviderFromContext,
+  isNewUserAuthContext,
+  markAuthContextAsNewUser,
+  trackAuthenticationCompleted,
+} from "@/utils/analytics/auth-funnel.server";
 
 const logger = createScopedLogger("auth");
 const EMAIL_ALREADY_LINKED_ERROR = "email_already_linked";
@@ -67,6 +75,9 @@ type AppleProfile = {
 
 const mobileAuthOrigins = env.MOBILE_AUTH_ORIGIN
   ? [env.MOBILE_AUTH_ORIGIN]
+  : [];
+const desktopAuthOrigins = env.DESKTOP_AUTH_ORIGIN
+  ? [env.DESKTOP_AUTH_ORIGIN]
   : [];
 const googleSocialProvider =
   googleLoginEnabled && !useGoogleOauthEmulator
@@ -209,6 +220,7 @@ export const betterAuthConfig = betterAuth({
     ...(env.OAUTH_PROXY_URL ? [env.OAUTH_PROXY_URL] : []),
     ...(env.ADDITIONAL_TRUSTED_ORIGINS ?? []),
     ...mobileAuthOrigins,
+    ...desktopAuthOrigins,
   ],
   secret: env.AUTH_SECRET || env.NEXTAUTH_SECRET,
   emailAndPassword: {
@@ -296,7 +308,8 @@ export const betterAuthConfig = betterAuth({
           });
           assertAllowedAuthSignupEmail(user.email);
         },
-        after: async (user) => {
+        after: async (user, context) => {
+          markAuthContextAsNewUser(context?.context);
           await postSignUp({
             id: user.id,
             email: user.email,
@@ -321,6 +334,26 @@ export const betterAuthConfig = betterAuth({
         },
       },
     },
+  },
+  hooks: {
+    after: createAuthMiddleware(async (context) => {
+      try {
+        const authenticatedSession = context.context.newSession;
+        if (!authenticatedSession) return;
+
+        const provider = getAuthProviderFromContext(context);
+        if (provider === "unknown") return;
+
+        const email = authenticatedSession.user.email;
+        const isNewUser = isNewUserAuthContext(context.context);
+
+        after(() =>
+          trackAuthenticationCompleted({ email, provider, isNewUser }),
+        );
+      } catch (error) {
+        logger.error("Failed to schedule authentication analytics", { error });
+      }
+    }),
   },
   onAPIError: {
     throw: true,

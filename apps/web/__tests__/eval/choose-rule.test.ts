@@ -213,9 +213,6 @@ const multiRuleStressTestCases = [
     allowedRuleNames: [],
     maxRuleCount: 0,
   },
-];
-
-const borderlineMultiRuleTestCases = [
   {
     name: "operational office notice",
     email: getEmail({
@@ -224,10 +221,13 @@ const borderlineMultiRuleTestCases = [
       content:
         "The main lobby entrance will be closed Friday from 1 PM to 4 PM for maintenance. Please use the side entrance during that window. No action is required.",
     }),
-    acceptablePrimaryRuleNames: ["Account notifications"],
-    allowedRuleNames: ["Account notifications"],
-    maxRuleCount: 1,
+    expectedPrimaryRule: null,
+    allowedRuleNames: [],
+    maxRuleCount: 0,
   },
+];
+
+const borderlineMultiRuleTestCases = [
   {
     name: "privacy update with product controls",
     email: getEmail({
@@ -686,8 +686,9 @@ describe.runIf(shouldRunEval)("Eval: Choose Rule", () => {
       const expectedLabel = Array.isArray(tc.expectedRule)
         ? tc.expectedRule.join(" | ")
         : (tc.expectedRule ?? "no match");
+      const testName = `${tc.email.from} / ${tc.email.subject} → ${expectedLabel}`;
       test(
-        `${tc.email.from} → ${expectedLabel}`,
+        testName,
         async () => {
           const result = await aiChooseRule({
             email: tc.email,
@@ -705,7 +706,7 @@ describe.runIf(shouldRunEval)("Eval: Choose Rule", () => {
           const pass = acceptable.includes(actual);
 
           evalReporter.record({
-            testName: `${tc.email.from} → ${expectedLabel}`,
+            testName,
             model: model.label,
             pass,
             expected: expectedLabel,

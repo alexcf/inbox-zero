@@ -1,44 +1,48 @@
 import { startTransition, useMemo, useState, useRef, useEffect } from "react";
 import { useTheme } from "next-themes";
-import DOMPurify from "dompurify";
-import { env } from "@/env";
 import { decodeHtmlEntities } from "@/utils/gmail/decode";
-import { getImageProxyBaseUrl } from "@/utils/email/image-proxy-config";
+import {
+  getPreparedEmailHtml,
+  IMAGE_PROXY_BASE_URL,
+  IMAGE_PROXY_ORIGIN,
+  prepareSanitizedEmailHtml,
+  sanitizeEmailHtml,
+} from "@/utils/email/prepare-html.client";
 
-const IMAGE_PROXY_BASE_URL = getImageProxyBaseUrl({
-  baseUrl: env.NEXT_PUBLIC_BASE_URL,
-  externalProxyBaseUrl: env.NEXT_PUBLIC_IMAGE_PROXY_BASE_URL,
-  useAppRoute: env.NEXT_PUBLIC_IMAGE_PROXY_USE_APP_ROUTE,
-});
-const IMAGE_PROXY_ORIGIN = IMAGE_PROXY_BASE_URL
-  ? new URL(IMAGE_PROXY_BASE_URL).origin
-  : null;
-const IMAGE_PROXY_ENABLED = Boolean(IMAGE_PROXY_BASE_URL);
-const IMAGE_PROXY_RENDER_ROUTE = "/api/email/render-html";
 const SANS_FONT_STACK = `ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`;
+/**
+ * Reading size for a message body that brought no styling of its own. Shared by
+ * both paths: Tailwind classes can't reach inside the iframe, so plain text has
+ * to restate it or the two drift apart on screen.
+ */
+const BODY_TYPE = { fontSize: "14.5px", lineHeight: 1.65 } as const;
 
-export function HtmlEmail({ html }: { html: string }) {
-  const sanitizedHtml = useMemo(() => sanitize(html), [html]);
+export function HtmlEmail({
+  html,
+  messageId,
+}: {
+  html: string;
+  messageId: string;
+}) {
+  const sanitizedHtml = useMemo(() => sanitizeEmailHtml(html), [html]);
   const [showReplies, setShowReplies] = useState(false);
-  const [renderHtml, setRenderHtml] = useState(() => sanitizedHtml);
+  const [renderHtml, setRenderHtml] = useState(
+    () =>
+      getPreparedEmailHtml({ messageId, sourceHtml: sanitizedHtml }) ??
+      sanitizedHtml,
+  );
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const { theme } = useTheme();
   const isDarkMode = theme === "dark";
 
   useEffect(() => {
     let cancelled = false;
-    const controller = new AbortController();
+    setRenderHtml(
+      getPreparedEmailHtml({ messageId, sourceHtml: sanitizedHtml }) ??
+        sanitizedHtml,
+    );
 
-    setRenderHtml(sanitizedHtml);
-
-    if (!IMAGE_PROXY_ENABLED) {
-      return () => {
-        cancelled = true;
-        controller.abort();
-      };
-    }
-
-    rewriteHtmlWithProxy(sanitizedHtml, controller.signal).then(
+    prepareSanitizedEmailHtml({ messageId, sourceHtml: sanitizedHtml }).then(
       (rewrittenHtml) => {
         if (cancelled) return;
         startTransition(() => setRenderHtml(rewrittenHtml));
@@ -51,9 +55,8 @@ export function HtmlEmail({ html }: { html: string }) {
 
     return () => {
       cancelled = true;
-      controller.abort();
     };
-  }, [sanitizedHtml]);
+  }, [messageId, sanitizedHtml]);
 
   const { mainContent, hasReplies } = useMemo(
     () => getEmailContent(renderHtml),
@@ -99,7 +102,11 @@ export function HtmlEmail({ html }: { html: string }) {
 
 export function PlainEmail({ text }: { text: string }) {
   return (
-    <pre className="whitespace-pre-wrap text-foreground">
+    // `pre` keeps the sender's line breaks; the font stack keeps it readable.
+    <pre
+      className="whitespace-pre-wrap font-sans text-foreground"
+      style={BODY_TYPE}
+    >
       {decodeHtmlEntities(text)}
     </pre>
   );
@@ -192,6 +199,8 @@ function getIframeHtml(
       }
       body:not([style]):not([bgcolor]) {
         margin: 0;
+        font-size: ${BODY_TYPE.fontSize};
+        line-height: ${BODY_TYPE.lineHeight};
         color: hsl(var(--foreground));
         background-color: hsl(var(--background));
       }
@@ -279,25 +288,6 @@ function getIframeHtml(
 
   const htmlWithHead = wrapWithProperStructure(html);
   return addDarkModeClass(htmlWithHead, isDarkMode);
-}
-
-const sanitize = (html: string) =>
-  DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
-
-async function rewriteHtmlWithProxy(html: string, signal: AbortSignal) {
-  const response = await fetch(IMAGE_PROXY_RENDER_ROUTE, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ html }),
-    signal,
-  });
-
-  if (!response.ok) return html;
-
-  const data = await response.json();
-  return typeof data?.html === "string" ? data.html : html;
 }
 
 function addDarkModeClass(html: string, isDarkMode: boolean) {
