@@ -2,7 +2,7 @@
 # with BuildKit cache mounts stripped since this host has no buildx installed.
 # Regenerate from docker/Dockerfile.local if that file changes.
 
-FROM node:24-alpine AS builder
+FROM node:24-alpine AS deps
 
 WORKDIR /app
 
@@ -74,6 +74,12 @@ ENV QSTASH_CURRENT_SIGNING_KEY="dummy_qstash_curr_key_for_build"
 ENV QSTASH_NEXT_SIGNING_KEY="dummy_qstash_next_key_for_build"
 
 RUN npx prisma generate --schema=apps/web/prisma/schema.prisma
+
+# Eval/test target: full devDependencies (vitest etc.), no compiled .next output.
+# docker build --target eval-deps -t inbox-zero:eval-deps .
+FROM deps AS eval-deps
+
+FROM deps AS builder
 
 RUN cd apps/web && \
     ../../node_modules/.bin/next build --webpack && \

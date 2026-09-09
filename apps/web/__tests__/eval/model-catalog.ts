@@ -80,6 +80,23 @@ export const EVAL_MODEL_CATALOG: Record<string, EvalModel> = {
     label: "Ollama Gemma 4 E2B",
     includeInAll: false,
   },
+  // Same qwen3.6-35b weights behind LiteLLM, differing only in
+  // chat_template_kwargs.enable_thinking. Run against
+  // OPENAI_COMPATIBLE_BASE_URL=<litellm base>/v1 with LLM_API_KEY set to a
+  // LiteLLM virtual key scoped to these two aliases - a raw llama.cpp
+  // endpoint (bypassing LiteLLM) does not expose either alias.
+  main: {
+    provider: "openai-compatible",
+    model: "main",
+    label: "Qwen 3.6 35B (thinking on)",
+    includeInAll: false,
+  },
+  "main-fast": {
+    provider: "openai-compatible",
+    model: "main-fast",
+    label: "Qwen 3.6 35B (thinking off)",
+    includeInAll: false,
+  },
 };
 
 /**

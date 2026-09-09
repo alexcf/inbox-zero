@@ -28,6 +28,9 @@ function getEvalJudgeApiKey(provider: string) {
     anthropic: process.env.ANTHROPIC_API_KEY,
     google: process.env.GOOGLE_API_KEY,
     groq: process.env.GROQ_API_KEY,
+    // Self-hosted LiteLLM gateway (or any other OpenAI-compatible endpoint) -
+    // set EVAL_JUDGE_MODEL to a model available on OPENAI_COMPATIBLE_BASE_URL.
+    "openai-compatible": process.env.LLM_API_KEY,
   };
 
   return providerApiKeys[provider];
