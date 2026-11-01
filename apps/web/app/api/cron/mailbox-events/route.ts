@@ -1,5 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { deliverReceivedOutbox } from "@/utils/mailbox-events/worker";
+import { processReceivedCheckpoint } from "@/utils/mailbox-events/checkpoint-worker";
+
+export const maxDuration = 300;
 
 // Do not log authorization headers, response bodies, or provider identifiers.
 export async function GET(request: Request) {
@@ -10,5 +13,7 @@ export async function GET(request: Request) {
   const b = Buffer.from(expected);
   if (!secret || a.length !== b.length || !timingSafeEqual(a, b))
     return new Response("Unauthorized", { status: 401 });
-  return Response.json(await deliverReceivedOutbox());
+  const checkpoint = await processReceivedCheckpoint();
+  const delivery = await deliverReceivedOutbox();
+  return Response.json({ checkpoint, delivery });
 }

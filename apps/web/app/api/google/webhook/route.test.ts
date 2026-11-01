@@ -7,6 +7,7 @@ const {
   getWebhookEmailAccountMock,
   getEmailProviderRateLimitStateMock,
   cleanupWebhookAccountOnRateLimitSkipMock,
+  captureReceivedNotificationMock,
 } = vi.hoisted(() => ({
   envMock: {
     GOOGLE_PUBSUB_VERIFICATION_TOKEN: "test-google-webhook-token" as
@@ -18,6 +19,7 @@ const {
   getWebhookEmailAccountMock: vi.fn(),
   getEmailProviderRateLimitStateMock: vi.fn(),
   cleanupWebhookAccountOnRateLimitSkipMock: vi.fn(),
+  captureReceivedNotificationMock: vi.fn(),
 }));
 
 vi.mock("@/utils/middleware", async () => {
@@ -39,6 +41,11 @@ vi.mock("@/utils/webhook/google/process-history", () => ({
 
 vi.mock("@/utils/webhook/error-handler", () => ({
   handleWebhookError: vi.fn(),
+}));
+
+vi.mock("@/utils/mailbox-events/store", () => ({
+  captureReceivedNotification: (...args: unknown[]) =>
+    captureReceivedNotificationMock(...args),
 }));
 
 vi.mock("@/utils/logger-flush", () => ({
@@ -69,6 +76,7 @@ describe("Google webhook route", () => {
     getWebhookEmailAccountMock.mockResolvedValue(null);
     getEmailProviderRateLimitStateMock.mockResolvedValue(null);
     cleanupWebhookAccountOnRateLimitSkipMock.mockResolvedValue(undefined);
+    captureReceivedNotificationMock.mockResolvedValue(undefined);
     runWithBackgroundLoggerFlushMock.mockImplementation(
       ({ task }: { task: () => Promise<void> }) => task(),
     );
@@ -142,18 +150,34 @@ describe("Google webhook route", () => {
     );
   });
 
-  it("propagates the configured account's processing failure and holds rate limits", async () => {
+  it("acknowledges the selected account after a durable notification without waiting for rules", async () => {
     vi.stubEnv("MAILBOX_RECEIVED_ENABLED", "true");
     vi.stubEnv("MAILBOX_RECEIVED_ACCOUNT_ID", "account-1");
     vi.stubEnv("MAILBOX_RECEIVED_URL", "https://example.test/receiver");
     vi.stubEnv("MAILBOX_RECEIVED_SECRET", "synthetic");
-    getWebhookEmailAccountMock.mockResolvedValue({ id: "account-1" });
-    processHistoryForUserMock.mockResolvedValue(new Response(null, { status: 503 }));
+    getWebhookEmailAccountMock.mockResolvedValue({
+      id: "account-1",
+      account: { provider: "google" },
+    });
     const request = () => createRequest({ token: "test-google-webhook-token" });
-    expect((await POST(request() as any, {} as any)).status).toBe(503);
+    expect((await POST(request() as any, {} as any)).status).toBe(200);
+    expect(captureReceivedNotificationMock).toHaveBeenCalledWith(
+      "account-1",
+      123,
+    );
     expect(runWithBackgroundLoggerFlushMock).not.toHaveBeenCalled();
-    getEmailProviderRateLimitStateMock.mockResolvedValue({ provider: "google", retryAt: new Date(), source: "test" });
+    expect(processHistoryForUserMock).not.toHaveBeenCalled();
+    captureReceivedNotificationMock.mockRejectedValueOnce(
+      new Error("synthetic persistence failure"),
+    );
     expect((await POST(request() as any, {} as any)).status).toBe(503);
+    getEmailProviderRateLimitStateMock.mockResolvedValue({
+      provider: "google",
+      retryAt: new Date(),
+      source: "test",
+    });
+    expect((await POST(request() as any, {} as any)).status).toBe(200);
+    expect(getEmailProviderRateLimitStateMock).not.toHaveBeenCalled();
     expect(cleanupWebhookAccountOnRateLimitSkipMock).not.toHaveBeenCalled();
     getWebhookEmailAccountMock.mockResolvedValue(null);
     expect((await POST(request() as any, {} as any)).status).toBe(503);

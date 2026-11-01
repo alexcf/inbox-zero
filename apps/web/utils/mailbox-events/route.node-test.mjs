@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 registerHooks({ resolve(specifier, context, next) {
   if (specifier === "@/utils/mailbox-events/worker") return { url: "data:text/javascript,export const deliverReceivedOutbox = async () => ({enabled:true,processed:0})", shortCircuit: true };
+  if (specifier === "@/utils/mailbox-events/checkpoint-worker") return { url: "data:text/javascript,export const processReceivedCheckpoint = async () => ({enabled:true,processed:0})", shortCircuit: true };
   return next(specifier, context);
 } });
 const { GET } = await import("../../app/api/cron/mailbox-events/route.ts");

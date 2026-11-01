@@ -1,4 +1,5 @@
 import { receivedConfig } from "@/utils/mailbox-events/received";
+import { captureReceivedNotification } from "@/utils/mailbox-events/store";
 import { after, NextResponse } from "next/server";
 import { withError } from "@/utils/middleware";
 import { env } from "@/env";
@@ -50,7 +51,7 @@ export const POST = withError("google/webhook", async (request) => {
     historyId: decodedData.historyId,
   });
 
-  logger.info("Received webhook - acknowledging immediately");
+  logger.info("Received webhook");
 
   const emailAccount = await getWebhookEmailAccount(
     { email: decodedData.emailAddress.toLowerCase() },
@@ -64,7 +65,7 @@ export const POST = withError("google/webhook", async (request) => {
     return NextResponse.json({ error: true }, { status: 503 });
   const receivedEnabled =
     !!emailAccount && received?.accountId === emailAccount.id;
-  if (emailAccount) {
+  if (emailAccount && !receivedEnabled) {
     const activeRateLimit = await getEmailProviderRateLimitState({
       emailAccountId: emailAccount.id,
       logger,
@@ -100,13 +101,18 @@ export const POST = withError("google/webhook", async (request) => {
     }
   }
 
-  // This scoped producer must not acknowledge until the outbox and cursor commit.
+  // The checkpoint survives a process restart; the cron worker fetches Gmail
+  // history and commits the Received outbox before advancing its own cursor.
   if (receivedEnabled) {
-    return processHistoryForUser(
-      decodedData,
-      { preloadedEmailAccount: emailAccount },
-      logger,
-    );
+    if (emailAccount?.account?.provider !== "google")
+      return NextResponse.json({ error: true }, { status: 503 });
+    try {
+      await captureReceivedNotification(emailAccount.id, decodedData.historyId);
+    } catch (error) {
+      logger.error("Failed to record mailbox received notification", { error });
+      return NextResponse.json({ error: true }, { status: 503 });
+    }
+    return NextResponse.json({ ok: true });
   }
 
   // Process history asynchronously using after() to avoid Pub/Sub acknowledgment timeout
