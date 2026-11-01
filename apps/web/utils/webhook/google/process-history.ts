@@ -1,3 +1,5 @@
+import { receivedConfig } from "@/utils/mailbox-events/received";
+import { enqueueReceivedAndAdvance } from "@/utils/mailbox-events/store";
 import uniqBy from "lodash/uniqBy";
 import { NextResponse } from "next/server";
 import * as Sentry from "@sentry/nextjs";
@@ -51,10 +53,15 @@ export async function processHistoryForUser(
   // biome-ignore lint/style/noParameterAssign: allowed for logging
   logger = logger.with({ email, emailAccountId: emailAccount?.id });
 
+  const received = receivedConfig();
+  const receivedEnabled =
+    !!emailAccount && received?.accountId === emailAccount.id;
   const validation = await validateWebhookAccount(emailAccount, logger);
 
   if (!validation.success) {
-    return validation.response;
+    return receivedEnabled
+      ? NextResponse.json({ error: true }, { status: 503 })
+      : validation.response;
   }
 
   const {
@@ -77,7 +84,10 @@ export async function processHistoryForUser(
     !validatedEmailAccount.account?.refresh_token
   ) {
     logger.error("Missing tokens after validation");
-    return NextResponse.json({ error: true });
+    return NextResponse.json(
+      { error: true },
+      { status: receivedEnabled ? 503 : 200 },
+    );
   }
 
   const accountAccessToken = validatedEmailAccount.account.access_token;
@@ -107,7 +117,9 @@ export async function processHistoryForUser(
           rateLimitSource: activeRateLimit.source,
         },
       );
-      return NextResponse.json({ ok: true });
+      return receivedEnabled
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
 
     return await withRateLimitRecording(
@@ -135,7 +147,15 @@ export async function processHistoryForUser(
           logger,
         });
 
+        if (
+          receivedEnabled &&
+          validatedEmailAccount.account?.provider !== "google"
+        ) {
+          throw new Error("Mailbox received account is not Google");
+        }
         if (historyResult.status === "expired") {
+          if (receivedEnabled)
+            throw new Error("Mailbox received history expired");
           await updateLastSyncedHistoryId({
             emailAccountId: validatedEmailAccount.id,
             lastSyncedHistoryId: historyId.toString(),
@@ -144,6 +164,10 @@ export async function processHistoryForUser(
         }
 
         const historyEntries = historyResult.history;
+        if (receivedEnabled && historyResult.skippedHistoryIds > 0) {
+          throw new Error("Mailbox received history truncated");
+        }
+        if (receivedEnabled) await hydrateReceivedLabels(historyEntries, gmail);
 
         if (historyEntries.length > 0) {
           logger.info("Processing history", {
@@ -171,6 +195,7 @@ export async function processHistoryForUser(
               },
             },
             logger,
+            receivedEnabled,
           );
         } else {
           // When we truncate a large gap, Gmail can return an empty recent window.
@@ -185,19 +210,31 @@ export async function processHistoryForUser(
           });
 
           // important to save this or we can get into a loop with never receiving history
-          await updateLastSyncedHistoryId({
-            emailAccountId: validatedEmailAccount.id,
-            lastSyncedHistoryId: historyId.toString(),
-          });
+          if (!receivedEnabled)
+            await updateLastSyncedHistoryId({
+              emailAccountId: validatedEmailAccount.id,
+              lastSyncedHistoryId: historyId.toString(),
+            });
         }
 
+        if (receivedEnabled) {
+          const end = historyEntries.at(-1)?.id || historyId.toString();
+          await enqueueReceivedAndAdvance(
+            validatedEmailAccount.id,
+            historyResult.startHistoryId,
+            end,
+            historyEntries,
+          );
+        }
         return NextResponse.json({ ok: true });
       },
     );
   } catch (error) {
     if (isInvalidGrantError(error)) {
       logger.warn("Invalid grant", { email });
-      return NextResponse.json({ ok: true });
+      return receivedEnabled
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
 
     captureException(error, { userEmail: email, extra: { decodedData } });
@@ -212,11 +249,49 @@ export async function processHistoryForUser(
           : error,
     });
     // returning 200 here, as otherwise PubSub will call the webhook over and over
-    return NextResponse.json({ error: true });
+    return NextResponse.json(
+      { error: true },
+      { status: receivedEnabled ? 503 : 200 },
+    );
   }
 }
 
-async function processHistory(options: ProcessHistoryOptions, logger: Logger) {
+// Gmail history may omit message labels. Fetch only metadata and hold when
+// current labels cannot prove either an inbox arrival or an outgoing draft.
+export async function hydrateReceivedLabels(
+  history: gmail_v1.Schema$History[],
+  gmail: gmail_v1.Gmail,
+) {
+  for (const entry of history)
+    for (const addition of entry.messagesAdded || []) {
+      const message = addition.message;
+      if (!message?.id || !message.threadId)
+        throw new Error("Incomplete received history message");
+      if (Array.isArray(message.labelIds)) continue;
+      const result = await gmail.users.messages.get({
+        userId: "me",
+        id: message.id,
+        format: "minimal",
+      });
+      const labels = result.data.labelIds;
+      if (
+        !labels?.some(
+          (label) => label === "INBOX" || label === "SENT" || label === "DRAFT",
+        )
+      ) {
+        throw new Error("Mailbox received history labels unavailable");
+      }
+      if (result.data.threadId && result.data.threadId !== message.threadId)
+        throw new Error("Mailbox received thread changed");
+      message.labelIds = labels;
+    }
+}
+
+async function processHistory(
+  options: ProcessHistoryOptions,
+  logger: Logger,
+  deferCursor = false,
+) {
   const { history, emailAccount } = options;
   const { email: userEmail, id: emailAccountId } = emailAccount;
 
@@ -279,10 +354,11 @@ async function processHistory(options: ProcessHistoryOptions, logger: Logger) {
 
   const lastSyncedHistoryId = history[history.length - 1].id;
 
-  await updateLastSyncedHistoryId({
-    emailAccountId,
-    lastSyncedHistoryId,
-  });
+  if (!deferCursor)
+    await updateLastSyncedHistoryId({
+      emailAccountId,
+      lastSyncedHistoryId,
+    });
 }
 
 /**

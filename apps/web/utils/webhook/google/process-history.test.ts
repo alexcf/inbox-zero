@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { processHistoryForUser } from "./process-history";
+import { hydrateReceivedLabels, processHistoryForUser } from "./process-history";
 import { getHistory } from "@/utils/gmail/history";
 import {
   getWebhookEmailAccount,
@@ -34,6 +34,7 @@ vi.mock("@/utils/prisma", () => ({
 }));
 
 vi.mock("@/utils/error", () => ({
+  isInvalidGrantError: vi.fn().mockReturnValue(false),
   captureException: vi.fn(),
 }));
 
@@ -315,5 +316,51 @@ describe("processHistoryForUser - 404 Handling", () => {
       expect.any(Object),
     );
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("received Gmail history labels", () => {
+  it("fetches minimal metadata when history has only identifiers", async () => {
+    const history = [{ messagesAdded: [{ message: { id: "synthetic", threadId: "thread" } }] }];
+    const get = vi.fn().mockResolvedValue({ data: { threadId: "thread", labelIds: ["INBOX"] } });
+    await hydrateReceivedLabels(history, { users: { messages: { get } } } as any);
+    expect(get).toHaveBeenCalledWith({ userId: "me", id: "synthetic", format: "minimal" });
+    expect(history[0].messagesAdded[0].message).toMatchObject({ labelIds: ["INBOX"] });
+  });
+  it("holds when current metadata cannot establish the original direction", async () => {
+    const history = [{ messagesAdded: [{ message: { id: "synthetic", threadId: "thread" } }] }];
+    const get = vi.fn().mockResolvedValue({ data: { threadId: "thread", labelIds: ["IMPORTANT"] } });
+    await expect(hydrateReceivedLabels(history, { users: { messages: { get } } } as any)).rejects.toThrow();
+  });
+});
+
+describe("configured received history retry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv("MAILBOX_RECEIVED_ENABLED", "true");
+    vi.stubEnv("MAILBOX_RECEIVED_ACCOUNT_ID", "synthetic-account");
+    vi.stubEnv("MAILBOX_RECEIVED_URL", "https://example.test/receiver");
+    vi.stubEnv("MAILBOX_RECEIVED_SECRET", "synthetic");
+    const emailAccount = { id: "synthetic-account", email: "synthetic@example.test", lastSyncedHistoryId: "1000", account: { provider: "google", access_token: "synthetic", refresh_token: "synthetic" }, rules: [] };
+    vi.mocked(getWebhookEmailAccount).mockResolvedValue(emailAccount as any);
+    vi.mocked(validateWebhookAccount).mockResolvedValue({ success: true, data: { emailAccount, hasAutomationRules: false, hasAiAccess: false } } as any);
+    vi.mocked(getEmailProviderRateLimitState).mockResolvedValue(null);
+  });
+  it("returns 503 when outbox persistence fails", async () => {
+    vi.mocked(getHistory).mockResolvedValue({ history: [] } as any);
+    expect((await processHistoryForUser({ emailAddress: "synthetic@example.test", historyId: 2000 }, {}, logger)).status).toBe(503);
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+  it("returns 503 for rate limit and expired history without advancing the cursor", async () => {
+    vi.mocked(getEmailProviderRateLimitState).mockResolvedValue({ provider: "google", retryAt: new Date(), source: "test" });
+    expect((await processHistoryForUser({ emailAddress: "synthetic@example.test", historyId: 2000 }, {}, logger)).status).toBe(503);
+    vi.mocked(getEmailProviderRateLimitState).mockResolvedValue(null);
+    const expired = Object.assign(new Error("synthetic"), { status: 404 });
+    vi.mocked(getHistory).mockRejectedValue(expired);
+    expect((await processHistoryForUser({ emailAddress: "synthetic@example.test", historyId: 2000 }, {}, logger)).status).toBe(503);
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
   });
 });

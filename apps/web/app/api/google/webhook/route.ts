@@ -1,3 +1,4 @@
+import { receivedConfig } from "@/utils/mailbox-events/received";
 import { after, NextResponse } from "next/server";
 import { withError } from "@/utils/middleware";
 import { env } from "@/env";
@@ -56,6 +57,13 @@ export const POST = withError("google/webhook", async (request) => {
     logger,
   );
 
+  const received = receivedConfig();
+  // If enabled, an unresolved account must not silently acknowledge a possible
+  // notification for the configured account.
+  if (received && !emailAccount)
+    return NextResponse.json({ error: true }, { status: 503 });
+  const receivedEnabled =
+    !!emailAccount && received?.accountId === emailAccount.id;
   if (emailAccount) {
     const activeRateLimit = await getEmailProviderRateLimitState({
       emailAccountId: emailAccount.id,
@@ -68,6 +76,8 @@ export const POST = withError("google/webhook", async (request) => {
     });
 
     if (isGoogleProvider(activeRateLimit?.provider)) {
+      if (receivedEnabled)
+        return NextResponse.json({ error: true }, { status: 503 });
       await cleanupWebhookAccountOnRateLimitSkip(emailAccount, logger).catch(
         (error) => {
           logger.warn(
@@ -84,8 +94,19 @@ export const POST = withError("google/webhook", async (request) => {
         retryAt: activeRateLimit.retryAt.toISOString(),
         rateLimitSource: activeRateLimit.source,
       });
-      return NextResponse.json({ ok: true });
+      return receivedEnabled
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
+  }
+
+  // This scoped producer must not acknowledge until the outbox and cursor commit.
+  if (receivedEnabled) {
+    return processHistoryForUser(
+      decodedData,
+      { preloadedEmailAccount: emailAccount },
+      logger,
+    );
   }
 
   // Process history asynchronously using after() to avoid Pub/Sub acknowledgment timeout

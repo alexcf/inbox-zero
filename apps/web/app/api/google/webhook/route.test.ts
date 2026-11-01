@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   envMock,
@@ -61,6 +61,7 @@ vi.mock("@/utils/email/rate-limit", () => ({
 import { POST } from "./route";
 
 describe("Google webhook route", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.clearAllMocks();
     envMock.GOOGLE_PUBSUB_VERIFICATION_TOKEN = "test-google-webhook-token";
@@ -139,6 +140,23 @@ describe("Google webhook route", () => {
       { preloadedEmailAccount: { id: "account-1" } },
       expect.anything(),
     );
+  });
+
+  it("propagates the configured account's processing failure and holds rate limits", async () => {
+    vi.stubEnv("MAILBOX_RECEIVED_ENABLED", "true");
+    vi.stubEnv("MAILBOX_RECEIVED_ACCOUNT_ID", "account-1");
+    vi.stubEnv("MAILBOX_RECEIVED_URL", "https://example.test/receiver");
+    vi.stubEnv("MAILBOX_RECEIVED_SECRET", "synthetic");
+    getWebhookEmailAccountMock.mockResolvedValue({ id: "account-1" });
+    processHistoryForUserMock.mockResolvedValue(new Response(null, { status: 503 }));
+    const request = () => createRequest({ token: "test-google-webhook-token" });
+    expect((await POST(request() as any, {} as any)).status).toBe(503);
+    expect(runWithBackgroundLoggerFlushMock).not.toHaveBeenCalled();
+    getEmailProviderRateLimitStateMock.mockResolvedValue({ provider: "google", retryAt: new Date(), source: "test" });
+    expect((await POST(request() as any, {} as any)).status).toBe(503);
+    expect(cleanupWebhookAccountOnRateLimitSkipMock).not.toHaveBeenCalled();
+    getWebhookEmailAccountMock.mockResolvedValue(null);
+    expect((await POST(request() as any, {} as any)).status).toBe(503);
   });
 
   it("skips enqueueing background processing while provider rate limit is active", async () => {
