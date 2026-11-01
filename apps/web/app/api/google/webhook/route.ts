@@ -1,3 +1,5 @@
+import { receivedConfig } from "@/utils/mailbox-events/received";
+import { captureReceivedNotification } from "@/utils/mailbox-events/store";
 import { after, NextResponse } from "next/server";
 import { withError } from "@/utils/middleware";
 import { env } from "@/env";
@@ -49,14 +51,21 @@ export const POST = withError("google/webhook", async (request) => {
     historyId: decodedData.historyId,
   });
 
-  logger.info("Received webhook - acknowledging immediately");
+  logger.info("Received webhook");
 
   const emailAccount = await getWebhookEmailAccount(
     { email: decodedData.emailAddress.toLowerCase() },
     logger,
   );
 
-  if (emailAccount) {
+  const received = receivedConfig();
+  // If enabled, an unresolved account must not silently acknowledge a possible
+  // notification for the configured account.
+  if (received && !emailAccount)
+    return NextResponse.json({ error: true }, { status: 503 });
+  const receivedEnabled =
+    !!emailAccount && received?.accountId === emailAccount.id;
+  if (emailAccount && !receivedEnabled) {
     const activeRateLimit = await getEmailProviderRateLimitState({
       emailAccountId: emailAccount.id,
       logger,
@@ -68,6 +77,8 @@ export const POST = withError("google/webhook", async (request) => {
     });
 
     if (isGoogleProvider(activeRateLimit?.provider)) {
+      if (receivedEnabled)
+        return NextResponse.json({ error: true }, { status: 503 });
       await cleanupWebhookAccountOnRateLimitSkip(emailAccount, logger).catch(
         (error) => {
           logger.warn(
@@ -84,8 +95,24 @@ export const POST = withError("google/webhook", async (request) => {
         retryAt: activeRateLimit.retryAt.toISOString(),
         rateLimitSource: activeRateLimit.source,
       });
-      return NextResponse.json({ ok: true });
+      return receivedEnabled
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
+  }
+
+  // The checkpoint survives a process restart; the cron worker fetches Gmail
+  // history and commits the Received outbox before advancing its own cursor.
+  if (receivedEnabled) {
+    if (emailAccount?.account?.provider !== "google")
+      return NextResponse.json({ error: true }, { status: 503 });
+    try {
+      await captureReceivedNotification(emailAccount.id, decodedData.historyId);
+    } catch (error) {
+      logger.error("Failed to record mailbox received notification", { error });
+      return NextResponse.json({ error: true }, { status: 503 });
+    }
+    return NextResponse.json({ ok: true });
   }
 
   // Process history asynchronously using after() to avoid Pub/Sub acknowledgment timeout

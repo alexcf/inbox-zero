@@ -1,3 +1,4 @@
+import { enqueueReceivedAndAdvance } from "@/utils/mailbox-events/store";
 import uniqBy from "lodash/uniqBy";
 import { NextResponse } from "next/server";
 import * as Sentry from "@sentry/nextjs";
@@ -34,6 +35,8 @@ export async function processHistoryForUser(
   options: {
     startHistoryId?: string;
     preloadedEmailAccount?: ValidatedWebhookAccountData | null;
+    receivedLease?: { cursor: string; token: string };
+    retryErrors?: boolean;
   },
   logger: Logger,
 ) {
@@ -51,10 +54,14 @@ export async function processHistoryForUser(
   // biome-ignore lint/style/noParameterAssign: allowed for logging
   logger = logger.with({ email, emailAccountId: emailAccount?.id });
 
+  const receivedEnabled = !!options.receivedLease;
+  const retryErrors = receivedEnabled || !!options.retryErrors;
   const validation = await validateWebhookAccount(emailAccount, logger);
 
   if (!validation.success) {
-    return validation.response;
+    return retryErrors
+      ? NextResponse.json({ error: true }, { status: 503 })
+      : validation.response;
   }
 
   const {
@@ -77,7 +84,10 @@ export async function processHistoryForUser(
     !validatedEmailAccount.account?.refresh_token
   ) {
     logger.error("Missing tokens after validation");
-    return NextResponse.json({ error: true });
+    return NextResponse.json(
+      { error: true },
+      { status: retryErrors ? 503 : 200 },
+    );
   }
 
   const accountAccessToken = validatedEmailAccount.account.access_token;
@@ -107,7 +117,9 @@ export async function processHistoryForUser(
           rateLimitSource: activeRateLimit.source,
         },
       );
-      return NextResponse.json({ ok: true });
+      return retryErrors
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
 
     return await withRateLimitRecording(
@@ -129,13 +141,33 @@ export async function processHistoryForUser(
 
         const historyResult = await fetchGmailHistoryResilient({
           gmail,
-          emailAccount: validatedEmailAccount,
+          emailAccount: options.receivedLease
+            ? {
+                ...validatedEmailAccount,
+                lastSyncedHistoryId: options.receivedLease.cursor,
+              }
+            : validatedEmailAccount,
           webhookHistoryId: historyId,
-          options,
+          options:
+            options.receivedLease || options.retryErrors
+              ? {
+                  startHistoryId:
+                    options.receivedLease?.cursor ||
+                    validatedEmailAccount.lastSyncedHistoryId ||
+                    undefined,
+                }
+              : options,
           logger,
         });
 
+        if (
+          receivedEnabled &&
+          validatedEmailAccount.account?.provider !== "google"
+        ) {
+          throw new Error("Mailbox received account is not Google");
+        }
         if (historyResult.status === "expired") {
+          if (retryErrors) throw new Error("Mailbox received history expired");
           await updateLastSyncedHistoryId({
             emailAccountId: validatedEmailAccount.id,
             lastSyncedHistoryId: historyId.toString(),
@@ -144,6 +176,10 @@ export async function processHistoryForUser(
         }
 
         const historyEntries = historyResult.history;
+        if (retryErrors && historyResult.skippedHistoryIds > 0) {
+          throw new Error("Mailbox received history truncated");
+        }
+        if (receivedEnabled) await hydrateReceivedLabels(historyEntries, gmail);
 
         if (historyEntries.length > 0) {
           logger.info("Processing history", {
@@ -155,23 +191,25 @@ export async function processHistoryForUser(
             historyItemCount: historyResult.historyItemCount,
           });
 
-          await processHistory(
-            {
-              history: historyEntries,
-              gmail,
-              accessToken: accountAccessToken,
-              hasAutomationRules,
-              hasAiAccess: userHasAiAccess,
-              rules: validatedEmailAccount.rules,
-              emailAccount: {
-                ...validatedEmailAccount,
-                account: {
-                  provider: accountProvider,
+          if (!receivedEnabled)
+            await processHistory(
+              {
+                history: historyEntries,
+                gmail,
+                accessToken: accountAccessToken,
+                hasAutomationRules,
+                hasAiAccess: userHasAiAccess,
+                rules: validatedEmailAccount.rules,
+                emailAccount: {
+                  ...validatedEmailAccount,
+                  account: {
+                    provider: accountProvider,
+                  },
                 },
               },
-            },
-            logger,
-          );
+              logger,
+              retryErrors,
+            );
         } else {
           // When we truncate a large gap, Gmail can return an empty recent window.
           // We still need to advance to the webhook historyId so we don't stay
@@ -185,19 +223,32 @@ export async function processHistoryForUser(
           });
 
           // important to save this or we can get into a loop with never receiving history
-          await updateLastSyncedHistoryId({
-            emailAccountId: validatedEmailAccount.id,
-            lastSyncedHistoryId: historyId.toString(),
-          });
+          if (!receivedEnabled)
+            await updateLastSyncedHistoryId({
+              emailAccountId: validatedEmailAccount.id,
+              lastSyncedHistoryId: historyId.toString(),
+            });
         }
 
+        if (receivedEnabled) {
+          const end = historyEntries.at(-1)?.id || historyId.toString();
+          await enqueueReceivedAndAdvance(
+            validatedEmailAccount.id,
+            historyResult.startHistoryId,
+            end,
+            historyEntries,
+            options.receivedLease!.token,
+          );
+        }
         return NextResponse.json({ ok: true });
       },
     );
   } catch (error) {
     if (isInvalidGrantError(error)) {
       logger.warn("Invalid grant", { email });
-      return NextResponse.json({ ok: true });
+      return retryErrors
+        ? NextResponse.json({ error: true }, { status: 503 })
+        : NextResponse.json({ ok: true });
     }
 
     captureException(error, { userEmail: email, extra: { decodedData } });
@@ -212,11 +263,49 @@ export async function processHistoryForUser(
           : error,
     });
     // returning 200 here, as otherwise PubSub will call the webhook over and over
-    return NextResponse.json({ error: true });
+    return NextResponse.json(
+      { error: true },
+      { status: retryErrors ? 503 : 200 },
+    );
   }
 }
 
-async function processHistory(options: ProcessHistoryOptions, logger: Logger) {
+// Gmail history may omit message labels. Fetch only metadata and hold when
+// current labels cannot prove either an inbox arrival or an outgoing draft.
+export async function hydrateReceivedLabels(
+  history: gmail_v1.Schema$History[],
+  gmail: gmail_v1.Gmail,
+) {
+  for (const entry of history)
+    for (const addition of entry.messagesAdded || []) {
+      const message = addition.message;
+      if (!message?.id || !message.threadId)
+        throw new Error("Incomplete received history message");
+      if (Array.isArray(message.labelIds)) continue;
+      const result = await gmail.users.messages.get({
+        userId: "me",
+        id: message.id,
+        format: "minimal",
+      });
+      const labels = result.data.labelIds;
+      if (
+        !labels?.some(
+          (label) => label === "INBOX" || label === "SENT" || label === "DRAFT",
+        )
+      ) {
+        throw new Error("Mailbox received history labels unavailable");
+      }
+      if (result.data.threadId && result.data.threadId !== message.threadId)
+        throw new Error("Mailbox received thread changed");
+      message.labelIds = labels;
+    }
+}
+
+async function processHistory(
+  options: ProcessHistoryOptions,
+  logger: Logger,
+  retryErrors = false,
+) {
   const { history, emailAccount } = options;
   const { email: userEmail, id: emailAccountId } = emailAccount;
 
@@ -273,6 +362,7 @@ async function processHistory(options: ProcessHistoryOptions, logger: Logger) {
           extra: { messageId: event.item.message?.id },
         });
         logger.error("Error processing history item", { error });
+        if (retryErrors) throw error;
       }
     }
   }

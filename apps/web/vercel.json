@@ -61,6 +61,10 @@
   ],
   "crons": [
     {
+      "path": "/api/cron/mailbox-events",
+      "schedule": "* * * * *"
+    },
+    {
       "path": "/api/cron/scheduled-actions",
       "schedule": "* * * * *"
     },
